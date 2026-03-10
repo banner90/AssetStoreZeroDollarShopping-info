@@ -4,6 +4,7 @@
 import html
 import json
 import os
+from datetime import datetime
 import re
 import subprocess
 import sys
@@ -96,15 +97,30 @@ def _escape_html(text: str) -> str:
     return html.escape(str(text or ""), quote=False)
 
 
-def format_info_html(data: dict, extra_notice: str = "") -> str:
-    """生成 Unity Asset Store 风格的 HTML（从 index.html 引用的官网 CSS 提取的字体与颜色）"""
+def format_info_html(data: dict, extra_notice: str = "", dark: bool = False) -> str:
+    """生成 Unity Asset Store 风格的 HTML；dark=True 时使用深色背景与白色文字"""
     pid = data.get("packageId")
     display_name = data.get("displayName", "")
     detail = data.get("detail")
 
-    # 从 Unity Asset Store 官网 app.css 提取的 :root 样式与字体
-    # 字体: Inter, Noto Sans SC, Roboto... | 背景 #fff | 正文 #212121 | 链接 #3a5bc7 | 灰色 #757575 | 边框 #eceff1
-    style = """
+    if dark:
+        style = """
+    body { font-family: Inter, "Noto Sans SC", Roboto, "Segoe UI", sans-serif; background: #1a1a1a; color: #ffffff; margin: 12px 16px; font-size: 16px; line-height: 1.5; }
+    .title { font-size: 1.125rem; font-weight: 600; color: #ffffff; margin-bottom: 16px; }
+    .meta { color: #ffffff; margin-bottom: 16px; }
+    .meta-row { margin: 4px 0; }
+    .meta-label { color: #b0b0b0; font-size: 0.875rem; }
+    .section { margin-top: 20px; padding-top: 16px; border-top: 1px solid #444; }
+    .section-title { font-size: 0.875rem; font-weight: 600; color: #ffffff; margin-bottom: 8px; }
+    .desc, .notes { color: #ffffff; white-space: pre-wrap; word-wrap: break-word; }
+    .notice { background: #3d3d00; color: #e0e0a0; padding: 8px 12px; border-radius: 4px; margin-bottom: 12px; }
+    .uploads { margin: 4px 0; }
+    .uploads-item { padding: 2px 0; color: #ffffff; }
+    a { color: #7eb8ff; text-decoration: none; }
+    a:hover { color: #9ec8ff; text-decoration: underline; }
+    """
+    else:
+        style = """
     body {
         font-family: Inter, "Noto Sans SC", "Noto Sans JP", "Noto Sans KR", Roboto, -apple-system, BlinkMacSystemFont, "Segoe UI", Oxygen, Ubuntu, Cantarell, "Fira Sans", "Droid Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
         background: #fff;
@@ -138,7 +154,8 @@ def format_info_html(data: dict, extra_notice: str = "") -> str:
     parts.append(f'<div class="meta meta-row"><span class="meta-label">packageId</span> {_escape_html(str(pid))}</div>')
 
     if not detail:
-        parts.append('<p style="color:#757575;">无详情信息，请先在「获取包商店信息」中抓取。</p>')
+        muted = "#b0b0b0" if dark else "#757575"
+        parts.append(f'<p style="color:{muted};">无详情信息，请先在「获取包商店信息」中抓取。</p>')
         parts.append("</body></html>")
         return "".join(parts)
 
@@ -318,40 +335,60 @@ class PackageViewerApp:
     def _build_ui(self):
         main = ttk.Frame(self.root, padding=8)
         main.pack(fill=tk.BOTH, expand=True)
+        self._main_frame = main  # 用于固定放置「明/暗」主题按钮
 
-        notebook = ttk.Notebook(main)
-        notebook.pack(fill=tk.BOTH, expand=True)
+        self._notebook = ttk.Notebook(main)
+        self._notebook.pack(fill=tk.BOTH, expand=True)
+        notebook = self._notebook
 
-        # Tab 1: 包列表查看
-        tab1 = ttk.Frame(notebook, padding=4)
-        notebook.add(tab1, text="包列表查看")
-
-        ttk.Label(
-            tab1,
-            text=f"unitypackage 下载目录 (asset_store_config.json 的 download_dir): {self.download_dir}",
-        ).pack(anchor=tk.W)
-        if not self.download_dir.exists():
-            ttk.Label(tab1, text="(目录不存在)", foreground="red").pack(anchor=tk.W)
-
-        # 网页风格：与右侧详情一致的颜色与字体（资源列表与筛选区共用）
-        self._web_bg = "#f5f5f5"
-        self._web_fg = "#212121"
-        self._web_fg_muted = "#757575"
-        self._web_card_bg = "#ffffff"
-        self._web_select_bg = "#e3f2fd"
-        self._web_border = "#eceff1"
+        # 主题：浅色/深色（黑白色调），可切换；19:00～次日07:00 默认深色
+        hour = datetime.now().hour
+        self._dark_theme = hour >= 19 or hour < 7
+        self._THEME_LIGHT = {
+            "bg": "#f5f5f5", "fg": "#212121", "fg_muted": "#757575", "card": "#ffffff",
+            "select_bg": "#e3f2fd", "border": "#eceff1", "btn_bg": "#e0e0e0",
+            "btn_active": "#d0d0d0", "entry_bg": "#e0e0e0",
+        }
+        self._THEME_DARK = {
+            "bg": "#1a1a1a", "fg": "#ffffff", "fg_muted": "#b0b0b0", "card": "#2d2d2d",
+            "select_bg": "#1a3a52", "border": "#444444", "btn_bg": "#606060",
+            "btn_active": "#707070", "entry_bg": "#505050",
+        }
+        _t = self._THEME_DARK if self._dark_theme else self._THEME_LIGHT
+        self._web_bg = _t["bg"]
+        self._web_fg = _t["fg"]
+        self._web_fg_muted = _t["fg_muted"]
+        self._web_card_bg = _t["card"]
+        self._web_select_bg = _t["select_bg"]
+        self._web_border = _t["border"]
         try:
             _sty = ttk.Style()
             _sty.configure("Web.TFrame", background=self._web_bg)
             _sty.configure("Web.TLabel", background=self._web_bg, foreground=self._web_fg, font=("Segoe UI", 9))
-            _sty.configure("Web.TButton", background="#e0e0e0", foreground=self._web_fg, padding=(10, 4))
-            _sty.map("Web.TButton", background=[("active", "#d0d0d0"), ("pressed", "#bdbdbd")])
+            _sty.configure("Web.TButton", background=self._THEME_LIGHT["btn_bg"], foreground=self._web_fg, padding=(10, 4))
+            _sty.map("Web.TButton", background=[("active", self._THEME_LIGHT["btn_active"]), ("pressed", "#bdbdbd")])
             _sty.configure("Web.TCheckbutton", background=self._web_bg, foreground=self._web_fg)
             _sty.configure("Web.Card.TLabel", background=self._web_card_bg, foreground=self._web_fg, font=("Segoe UI", 9))
             _sty.configure("Web.Card.TCheckbutton", background=self._web_card_bg, foreground=self._web_fg)
             _sty.configure("Vertical.TScrollbar", troughrelief="flat")
         except Exception:
             pass
+
+        self._theme_frames_bg = []
+        # Tab 1: 包列表查看（使用 Web.TFrame 以随主题变色）
+        tab1 = ttk.Frame(notebook, style="Web.TFrame", padding=4)
+        notebook.add(tab1, text="包列表查看")
+        tab1_hint_row = tk.Frame(tab1, bg=self._web_bg)
+        tab1_hint_row.pack(fill=tk.X)
+        self._path_label = ttk.Label(
+            tab1_hint_row,
+            text=f"unitypackage 下载目录 (asset_store_config.json 的 download_dir): {self.download_dir}",
+            style="Web.TLabel",
+        )
+        self._path_label.pack(side=tk.LEFT, fill=tk.X, expand=True, anchor=tk.W)
+        self._theme_frames_bg.append(tab1_hint_row)
+        if not self.download_dir.exists():
+            ttk.Label(tab1, text="(目录不存在)", style="Web.TLabel", foreground="red").pack(anchor=tk.W)
 
         paned = ttk.PanedWindow(tab1, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True, pady=4)
@@ -363,14 +400,35 @@ class PackageViewerApp:
         left_frame.pack(fill=tk.BOTH, expand=True)
         search_row = tk.Frame(left_frame, bg=self._web_bg)
         search_row.pack(fill=tk.X, pady=(0, 6))
-        self.sort_btn = ttk.Button(
+        self.sort_btn = tk.Button(
             search_row,
             text="按购买顺序",
             command=lambda: self._toggle_sort(),
-            style="Web.TButton",
+            font=("Segoe UI", 10),
+            bg=self._THEME_LIGHT["btn_bg"],
+            fg=self._web_fg,
+            activebackground=self._THEME_LIGHT["btn_active"],
+            activeforeground=self._web_fg,
+            relief=tk.FLAT,
+            padx=10,
+            pady=4,
+            cursor="hand2",
         )
         self.sort_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.filter_btn = ttk.Button(search_row, text="筛选", command=self._toggle_filter_panel, style="Web.TButton")
+        self.filter_btn = tk.Button(
+            search_row,
+            text="筛选",
+            command=self._toggle_filter_panel,
+            font=("Segoe UI", 10),
+            bg=self._THEME_LIGHT["btn_bg"],
+            fg=self._web_fg,
+            activebackground=self._THEME_LIGHT["btn_active"],
+            activeforeground=self._web_fg,
+            relief=tk.FLAT,
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
         self.filter_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.listbox = tk.Listbox(
             left_frame,
@@ -392,7 +450,22 @@ class PackageViewerApp:
 
         btn_row = tk.Frame(left_container, bg=self._web_bg)
         btn_row.pack(anchor=tk.W, pady=(6, 0))
-        ttk.Button(btn_row, text="刷新列表", command=self._refresh, style="Web.TButton").pack(side=tk.LEFT)
+        self._refresh_btn = tk.Button(
+            btn_row,
+            text="刷新列表",
+            command=self._refresh,
+            font=("Segoe UI", 10),
+            bg=self._THEME_LIGHT["btn_bg"],
+            fg=self._web_fg,
+            activebackground=self._THEME_LIGHT["btn_active"],
+            activeforeground=self._web_fg,
+            relief=tk.FLAT,
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
+        self._refresh_btn.pack(side=tk.LEFT)
+        self._theme_frames_bg.extend([left_container, left_frame, search_row, btn_row])
 
         right_frame = tk.Frame(paned, bg=self._web_bg, padx=8, pady=4)
         paned.add(right_frame, weight=1)
@@ -402,6 +475,7 @@ class PackageViewerApp:
         self.detail_container = tk.Frame(right_frame, bg=self._web_bg)
         self.detail_container.pack(fill=tk.BOTH, expand=True)
         self.filter_container = tk.Frame(right_frame, bg=self._web_bg)
+        self._theme_frames_bg.extend([right_frame, self.detail_container, self.filter_container])
 
         self._use_html = HAS_HTML_FRAME
         if self._use_html:
@@ -444,30 +518,106 @@ class PackageViewerApp:
         self._main_sash_set = False
         self.root.after(400, self._set_main_sash_once)
 
-        # Tab 2: 获取包商店信息
-        tab2 = ttk.Frame(notebook, padding=8)
+        # Tab 2: 获取包商店信息（网页样式 + 随主题变色）
+        tab2 = ttk.Frame(notebook, style="Web.TFrame", padding=8)
         notebook.add(tab2, text="获取包商店信息")
+        self._tab2_container = tk.Frame(tab2, bg=self._web_bg)
+        self._tab2_container.pack(fill=tk.BOTH, expand=True)
+        self._theme_frames_bg.append(self._tab2_container)
 
+        tab2_hint_row = tk.Frame(self._tab2_container, bg=self._web_bg)
+        tab2_hint_row.pack(fill=tk.X)
+        self._theme_frames_bg.append(tab2_hint_row)
         ttk.Label(
-            tab2,
+            tab2_hint_row,
+            style="Web.TLabel",
             text="根据 purchases_snapshot.json 文件获取每个包的详情到 metadata 目录，"
             "请保证已经执行过 unity_assets_downloader.py 的「拉取已购买资产列表」阶段。",
-        ).pack(anchor=tk.W)
-        row = ttk.Frame(tab2)
-        row.pack(fill=tk.X, pady=4)
-        ttk.Label(row, text="限制数量 (0=全部):").pack(side=tk.LEFT)
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, anchor=tk.W)
+        fetch_row = tk.Frame(self._tab2_container, bg=self._web_bg)
+        fetch_row.pack(fill=tk.X, pady=4)
+        self._theme_frames_bg.append(fetch_row)
+        ttk.Label(fetch_row, text="限制数量 (0=全部):", style="Web.TLabel").pack(side=tk.LEFT)
         self.limit_var = tk.IntVar(value=0)
-        self.limit_spin = ttk.Spinbox(row, from_=0, to=99999, textvariable=self.limit_var, width=8)
-        self.limit_spin.pack(side=tk.LEFT, padx=4)
-        self.fetch_btn = ttk.Button(row, text="开始获取", command=self._start_fetch)
+        self._limit_entry = tk.Entry(
+            fetch_row,
+            textvariable=self.limit_var,
+            width=10,
+            font=("Segoe UI", 10),
+            bg=self._THEME_LIGHT["entry_bg"],
+            fg=self._web_fg,
+            insertbackground=self._web_fg,
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightcolor=self._web_border,
+            highlightbackground=self._web_border,
+        )
+        self._limit_entry.pack(side=tk.LEFT, padx=4, ipady=2, ipadx=4)
+        self.fetch_btn = tk.Button(
+            fetch_row,
+            text="开始获取",
+            command=self._start_fetch,
+            font=("Segoe UI", 10),
+            bg=self._THEME_LIGHT["btn_bg"],
+            fg=self._web_fg,
+            activebackground=self._THEME_LIGHT["btn_active"],
+            activeforeground=self._web_fg,
+            relief=tk.FLAT,
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
         self.fetch_btn.pack(side=tk.LEFT, padx=4)
-        self.fetch_status = ttk.Label(row, text="")
+        self.fetch_status = ttk.Label(fetch_row, text="", style="Web.TLabel")
         self.fetch_status.pack(side=tk.LEFT, padx=8)
 
-        self.fetch_log = scrolledtext.ScrolledText(tab2, wrap=tk.WORD, font=("Consolas", 9), height=20)
-        self.fetch_log.pack(fill=tk.BOTH, expand=True, pady=4)
+        # 日志区：Text + ttk 扁平滚动条（与包列表一致）
+        fetch_log_frame = tk.Frame(self._tab2_container, bg=self._web_bg)
+        fetch_log_frame.pack(fill=tk.BOTH, expand=True, pady=4)
+        self._theme_frames_bg.append(fetch_log_frame)
+        self.fetch_log = tk.Text(
+            fetch_log_frame,
+            wrap=tk.WORD,
+            font=("Consolas", 9),
+            height=20,
+            bg=self._web_card_bg,
+            fg=self._web_fg,
+            relief=tk.FLAT,
+            highlightthickness=0,
+        )
+        fetch_log_scroll = ttk.Scrollbar(fetch_log_frame, command=self.fetch_log.yview)
+        self.fetch_log.configure(yscrollcommand=fetch_log_scroll.set)
+        self.fetch_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        fetch_log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.fetch_log.bind("<MouseWheel>", lambda e: self.fetch_log.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+
+        # 切换到「获取包商店信息」页签时不把焦点给限制数量输入框
+        self._notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
         self._refresh()
+
+        # 「明/暗」主题：固定在整个 UI 内容区右上角，不随页签切换移动
+        self._theme_btn = tk.Label(
+            self._main_frame,
+            text="暗",
+            font=("Segoe UI", 11),
+            cursor="hand2",
+            bg=self._web_bg,
+            fg=self._web_fg,
+        )
+        self._theme_btn.place(relx=1, rely=0, x=-12, y=25, anchor=tk.NE)
+        self._theme_btn.bind("<Button-1>", lambda e: self._toggle_theme())
+        self._theme_btn.lift()
+
+        self._apply_theme()  # 按当前时段（或默认）应用明/暗主题
+
+    def _on_notebook_tab_changed(self, event=None):
+        """切换到「获取包商店信息」页签时，焦点移到 notebook，避免限制数量输入框默认获焦"""
+        try:
+            if self._notebook.index(self._notebook.select()) == 1:
+                self.root.after(0, self._notebook.focus_set)
+        except (tk.TclError, ValueError):
+            pass
 
     def _toggle_filter_panel(self):
         """切换筛选界面：打开则显示筛选面板，关闭则显示包详情"""
@@ -563,6 +713,84 @@ class PackageViewerApp:
         except Exception:
             pass
 
+    def _theme_colors(self):
+        """当前主题色字典"""
+        return self._THEME_DARK if self._dark_theme else self._THEME_LIGHT
+
+    def _toggle_theme(self):
+        """切换浅色/深色主题"""
+        self._dark_theme = not self._dark_theme
+        self._apply_theme()
+
+    def _apply_theme(self):
+        """应用当前主题到所有相关控件"""
+        t = self._theme_colors()
+        self._web_bg = t["bg"]
+        self._web_fg = t["fg"]
+        self._web_fg_muted = t["fg_muted"]
+        self._web_card_bg = t["card"]
+        self._web_select_bg = t["select_bg"]
+        self._web_border = t["border"]
+        try:
+            s = ttk.Style()
+            s.configure("Web.TFrame", background=self._web_bg)
+            s.configure("Web.TLabel", background=self._web_bg, foreground=self._web_fg, font=("Segoe UI", 9))
+            s.configure("Web.TButton", background=t["btn_bg"], foreground=self._web_fg, padding=(10, 4))
+            s.map("Web.TButton", background=[("active", t["btn_active"]), ("pressed", "#505050" if self._dark_theme else "#bdbdbd")])
+            s.configure("Web.TCheckbutton", background=self._web_bg, foreground=self._web_fg)
+            s.configure("Web.Card.TLabel", background=self._web_card_bg, foreground=self._web_fg, font=("Segoe UI", 9))
+            s.configure("Web.Card.TCheckbutton", background=self._web_card_bg, foreground=self._web_fg)
+        except Exception:
+            pass
+        for w in getattr(self, "_theme_frames_bg", []):
+            if w.winfo_exists():
+                w.config(bg=self._web_bg)
+        if getattr(self, "listbox", None) and self.listbox.winfo_exists():
+            self.listbox.config(bg=self._web_card_bg, fg=self._web_fg, selectbackground=self._web_select_bg, selectforeground=self._web_fg)
+        for btn in (getattr(self, "sort_btn", None), getattr(self, "filter_btn", None), getattr(self, "_refresh_btn", None)):
+            if btn and btn.winfo_exists():
+                btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
+        # 整个 UI 右上角固定的「明/暗」：暗=当前深色（点一下切回浅色）；明=当前浅色（点一下切深色）
+        theme_text = "明" if self._dark_theme else "暗"
+        theme_fg = "#ffffff" if self._dark_theme else "#212121"
+        if getattr(self, "_theme_btn", None) and self._theme_btn.winfo_exists():
+            self._theme_btn.config(bg=self._web_bg, fg=theme_fg, text=theme_text)
+        if getattr(self, "_open_in_unity_frame", None) and self._open_in_unity_frame.winfo_exists():
+            self._open_in_unity_btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
+        if getattr(self, "_filter_clear_btn", None) and self._filter_clear_btn.winfo_exists():
+            self._filter_clear_btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
+        for name in ("_filter_search_row", "_filter_type_frame", "_filter_type_canvas", "_filter_pub_frame", "_filter_pub_canvas", "_filter_pub_inner"):
+            w = getattr(self, name, None)
+            if w and w.winfo_exists():
+                w.config(bg=self._web_bg)
+        if getattr(self, "_filter_type_inner", None) and self._filter_type_inner.winfo_exists():
+            self._filter_type_inner.config(bg=self._web_card_bg)
+        if getattr(self, "_filter_pub_lf", None) and self._filter_pub_lf.winfo_exists():
+            self._filter_pub_lf.config(bg=self._web_card_bg)
+        for name in ("_filter_entry", "_pub_entry"):
+            w = getattr(self, name, None)
+            if w and w.winfo_exists():
+                w.config(bg=t["entry_bg"], fg=self._web_fg, insertbackground=self._web_fg, highlightcolor=self._web_border, highlightbackground=self._web_border)
+        # 获取包商店信息页签：输入框、按钮、日志区随主题
+        if getattr(self, "_limit_entry", None) and self._limit_entry.winfo_exists():
+            self._limit_entry.config(bg=t["entry_bg"], fg=self._web_fg, insertbackground=self._web_fg, highlightcolor=self._web_border, highlightbackground=self._web_border)
+        if getattr(self, "fetch_btn", None) and self.fetch_btn.winfo_exists():
+            self.fetch_btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
+        if getattr(self, "fetch_log", None) and self.fetch_log.winfo_exists():
+            self.fetch_log.config(bg=self._web_card_bg, fg=self._web_fg)
+        if not getattr(self, "_use_html", True) and getattr(self, "detail_widget", None) and self.detail_widget.winfo_exists():
+            self.detail_widget.config(bg=self._web_card_bg, fg=self._web_fg)
+        # 主题切换后按当前类型重绘详情区（包详情 / 摘要），使 HTML 随主题变色
+        dtype = getattr(self, "_current_detail_type", None)
+        ddata = getattr(self, "_current_detail_data", None)
+        if dtype == "package" and isinstance(ddata, dict) and self._use_html:
+            self.detail_widget.load_html(format_info_html(ddata, dark=self._dark_theme))
+        elif dtype == "summary" and ddata and self._use_html:
+            body_bg = "#1a1a1a" if self._dark_theme else "#fff"
+            body_fg = "#ffffff" if self._dark_theme else "#212121"
+            html_msg = f'<html><body style="font-family:Segoe UI, sans-serif; background:{body_bg}; color:{body_fg}; padding:12px;"><p style="margin:0; font-weight:bold;">{html.escape(str(ddata))}</p></body></html>'
+            self.detail_widget.load_html(html_msg)
+
     def _build_filter_panel(self):
         """构建 Unity 风格的筛选面板。
         逻辑与数据说明：
@@ -575,16 +803,30 @@ class PackageViewerApp:
         # 搜索行：左侧为「搜索我的资源」+ 输入框，右侧为「清除筛选器」贴边
         search_row = tk.Frame(self.filter_container, bg=bg)
         search_row.pack(fill=tk.X, pady=(0, 10))
+        self._filter_search_row = search_row
         ttk.Label(search_row, text="搜索我的资源", style="Web.TLabel").pack(side=tk.LEFT, padx=(0, 6))
         self._filter_search_var = tk.StringVar()
         self._filter_search_var.trace_add("write", lambda *_: self._apply_filter_to_list())
-        _filter_entry = tk.Entry(
+        self._filter_entry = tk.Entry(
             search_row, textvariable=self._filter_search_var, width=28,
-            bg="#e0e0e0", fg=fg, insertbackground=fg, relief=tk.FLAT, highlightthickness=1,
+            bg=self._THEME_LIGHT["entry_bg"], fg=fg, insertbackground=fg, relief=tk.FLAT, highlightthickness=1,
             highlightcolor=border, highlightbackground=border, font=("Segoe UI", 10),
         )
-        _filter_entry.pack(side=tk.LEFT, padx=(0, 8), ipady=4, ipadx=6)
-        self._filter_clear_btn = ttk.Button(search_row, text="清除筛选器", command=self._filter_clear, style="Web.TButton")
+        self._filter_entry.pack(side=tk.LEFT, padx=(0, 8), ipady=4, ipadx=6)
+        self._filter_clear_btn = tk.Button(
+            search_row,
+            text="清除筛选器",
+            command=self._filter_clear,
+            font=("Segoe UI", 10),
+            bg=self._THEME_LIGHT["btn_bg"],
+            fg=fg,
+            activebackground=self._THEME_LIGHT["btn_active"],
+            activeforeground=fg,
+            relief=tk.FLAT,
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
         self._filter_clear_btn.pack(side=tk.RIGHT)
 
         # 类型 与 发行商 并排，各自独立上下滑动（无 sash 分割线）
@@ -608,22 +850,40 @@ class PackageViewerApp:
         # 左列：类型（固定较窄宽度）；右列发行商占剩余空间
         type_frame = tk.Frame(two_col, bg=bg)
         two_col.add(type_frame, weight=2)
+        self._filter_type_frame = type_frame
         type_canvas = tk.Canvas(type_frame, highlightthickness=0, bg=bg)
         type_scroll = ttk.Scrollbar(type_frame, command=type_canvas.yview)
         type_canvas.configure(yscrollcommand=type_scroll.set)
         type_inner = tk.Frame(type_frame, bg=card, padx=10, pady=10)
+        self._filter_type_canvas = type_canvas
+        self._filter_type_inner = type_inner
         ttk.Label(type_inner, text="类型", style="Web.Card.TLabel", font=("Segoe UI", 10, "bold")).pack(anchor=tk.W, pady=(0, 6))
         type_win_id = type_canvas.create_window((0, 0), window=type_inner, anchor=tk.NW)
         def _type_on_configure(e):
+            b = type_canvas.bbox("all")
             type_canvas.configure(scrollregion=type_canvas.bbox("all"))
             w = type_canvas.winfo_width()
+            ch = type_canvas.winfo_height()
+            content_h = (b[3] - b[1]) if b else 0
             if w > 1:
                 type_canvas.itemconfig(type_win_id, width=w)
+            type_canvas.itemconfig(type_win_id, height=max(content_h, ch) if ch > 0 else content_h)
         type_inner.bind("<Configure>", _type_on_configure)
-        type_canvas.bind("<Configure>", lambda e: type_canvas.itemconfig(type_win_id, width=e.width) if e.width > 1 else None)
+        def _type_canvas_configure(e):
+            if e.width > 1:
+                type_canvas.itemconfig(type_win_id, width=e.width)
+            if e.height > 1:
+                b = type_canvas.bbox("all")
+                content_h = (b[3] - b[1]) if b else e.height
+                type_canvas.itemconfig(type_win_id, height=max(content_h, e.height))
+        type_canvas.bind("<Configure>", _type_canvas_configure)
         type_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         type_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        type_canvas.bind("<MouseWheel>", lambda e: type_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+        def _type_wheel(e):
+            b = type_canvas.bbox("all")
+            if b and type_canvas.winfo_height() > 0 and (b[3] - b[1]) > type_canvas.winfo_height():
+                type_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        type_canvas.bind("<MouseWheel>", _type_wheel)
 
         self._filter_type_vars = {}
         type_counts = self._collect_category_counts()
@@ -637,40 +897,57 @@ class PackageViewerApp:
                 style="Web.Card.TCheckbutton",
             ).pack(anchor=tk.W)
         if not type_counts:
-            for default_type in ("2D", "3D", "VFX", "工具", "模板", "音频"):
-                self._filter_type_vars[default_type] = tk.BooleanVar(value=False)
-                ttk.Checkbutton(type_inner, text=default_type, variable=self._filter_type_vars[default_type], command=self._apply_filter_to_list, style="Web.Card.TCheckbutton").pack(anchor=tk.W)
+            ttk.Label(type_inner, text="(暂无类型数据，请先获取包商店信息)", style="Web.Card.TLabel", foreground=self._web_fg_muted).pack(anchor=tk.W)
 
         # 右列：发行商（独立滚动，weight 更大让发行商区域露出更多）
         pub_frame = tk.Frame(two_col, bg=bg)
         two_col.add(pub_frame, weight=4)
+        self._filter_pub_frame = pub_frame
         pub_canvas = tk.Canvas(pub_frame, highlightthickness=0, bg=bg)
         pub_scroll = ttk.Scrollbar(pub_frame, command=pub_canvas.yview)
         pub_canvas.configure(yscrollcommand=pub_scroll.set)
         pub_inner = tk.Frame(pub_canvas, bg=bg)
+        self._filter_pub_canvas = pub_canvas
+        self._filter_pub_inner = pub_inner
         pub_win_id = pub_canvas.create_window((0, 0), window=pub_inner, anchor=tk.NW)
         def _pub_on_configure(e):
+            b = pub_canvas.bbox("all")
             pub_canvas.configure(scrollregion=pub_canvas.bbox("all"))
             w = pub_canvas.winfo_width()
+            ch = pub_canvas.winfo_height()
+            content_h = (b[3] - b[1]) if b else 0
             if w > 1:
                 pub_canvas.itemconfig(pub_win_id, width=w)
+            pub_canvas.itemconfig(pub_win_id, height=max(content_h, ch) if ch > 0 else content_h)
         pub_inner.bind("<Configure>", _pub_on_configure)
-        pub_canvas.bind("<Configure>", lambda e: pub_canvas.itemconfig(pub_win_id, width=e.width) if e.width > 1 else None)
+        def _pub_canvas_configure(e):
+            if e.width > 1:
+                pub_canvas.itemconfig(pub_win_id, width=e.width)
+            if e.height > 1:
+                b = pub_canvas.bbox("all")
+                content_h = (b[3] - b[1]) if b else e.height
+                pub_canvas.itemconfig(pub_win_id, height=max(content_h, e.height))
+        pub_canvas.bind("<Configure>", _pub_canvas_configure)
         pub_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         pub_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        pub_canvas.bind("<MouseWheel>", lambda e: pub_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+        def _pub_wheel(e):
+            b = pub_canvas.bbox("all")
+            if b and pub_canvas.winfo_height() > 0 and (b[3] - b[1]) > pub_canvas.winfo_height():
+                pub_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        pub_canvas.bind("<MouseWheel>", _pub_wheel)
 
         pub_lf = tk.Frame(pub_inner, bg=card, padx=10, pady=10)
-        pub_lf.pack(fill=tk.X, pady=(0, 8))
+        self._filter_pub_lf = pub_lf
+        pub_lf.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         ttk.Label(pub_lf, text="发行商", style="Web.Card.TLabel", font=("Segoe UI", 10, "bold")).pack(anchor=tk.W, pady=(0, 6))
         self._filter_pub_search = tk.StringVar()
         ttk.Label(pub_lf, text="搜索发行商", style="Web.Card.TLabel").pack(anchor=tk.W)
-        _pub_entry = tk.Entry(
+        self._pub_entry = tk.Entry(
             pub_lf, textvariable=self._filter_pub_search, width=26,
-            bg="#e0e0e0", fg=fg, insertbackground=fg, relief=tk.FLAT, highlightthickness=1,
+            bg=self._THEME_LIGHT["entry_bg"], fg=fg, insertbackground=fg, relief=tk.FLAT, highlightthickness=1,
             highlightcolor=border, highlightbackground=border, font=("Segoe UI", 10),
         )
-        _pub_entry.pack(fill=tk.X, pady=(4, 8), ipady=4, ipadx=6)
+        self._pub_entry.pack(fill=tk.X, pady=(4, 8), ipady=4, ipadx=6)
         self._filter_pub_vars = {}
         pub_counts = self._collect_publisher_counts()
         for pub_name, count in sorted(pub_counts.items(), key=lambda x: -x[1])[:20]:
@@ -733,25 +1010,36 @@ class PackageViewerApp:
         """根据筛选条件过滤左侧列表。已实现：搜索我的资源、类型、发行商。"""
         self._filter_list()
 
-    def _set_detail_content(self, html_content: str = None, plain_text: str = None):
-        """设置右侧详情内容。有 html_content 时用网页；否则用纯文本（兼容无 tkinterweb）"""
-        # 切换详情时先隐藏按钮，等详情渲染好后再根据选中项延迟显示
+    def _set_detail_content(self, html_content: str = None, plain_text: str = None, _detail_type: str = None, _detail_data=None):
+        """设置右侧详情内容。有 html_content 时用网页；否则用纯文本。_detail_type/_detail_data 用于主题切换时重绘。"""
         frame = getattr(self, "_open_in_unity_frame", None)
         if frame and frame.winfo_exists():
             frame.place_forget()
+        dark = self._dark_theme
         if self._use_html:
             if html_content is not None:
                 self.detail_widget.load_html(html_content)
+                self._current_detail_type = _detail_type or "html"
+                self._current_detail_data = _detail_data
+                self._current_summary_msg = None
             elif plain_text is not None:
-                # 无 tkinterweb 时不会进这里；有则简单用 <pre> 包装
-                simple_html = f'<html><body style="font-family:Segoe UI; background:#fff; color:#222; padding:12px;"><pre style="margin:0; white-space:pre-wrap;">{html.escape(plain_text)}</pre></body></html>'
+                body_bg = "#1a1a1a" if dark else "#fff"
+                body_fg = "#ffffff" if dark else "#222"
+                simple_html = f'<html><body style="font-family:Segoe UI; background:{body_bg}; color:{body_fg}; padding:12px;"><pre style="margin:0; white-space:pre-wrap;">{html.escape(plain_text)}</pre></body></html>'
                 self.detail_widget.load_html(simple_html)
+                self._current_detail_type = "plain"
+                self._current_detail_data = None
+                self._current_summary_msg = None
         else:
             self.detail_widget.config(state=tk.NORMAL)
             self.detail_widget.delete(1.0, tk.END)
             self.detail_widget.insert(tk.END, plain_text or html_content or "")
             self.detail_widget.config(state=tk.DISABLED)
-        # 详情更新后延迟再显示按钮，让「消失→再出现」过程明显（约 800ms）
+            if hasattr(self, "_web_bg"):
+                self.detail_widget.config(bg=self._web_card_bg, fg=self._web_fg)
+            self._current_detail_type = _detail_type or "plain"
+            self._current_detail_data = _detail_data
+            self._current_summary_msg = None
         self.root.after(800, self._update_open_in_unity_visibility)
 
     def _toggle_sort(self):
@@ -811,12 +1099,16 @@ class PackageViewerApp:
 
         self._filter_list()
         msg = f"共 {purchased_downloaded} 个已下载，{len(self.missing_items)} 个未下载（红色），合计 {purchased_downloaded + len(self.missing_items)} 个资源"
+        self._current_summary_msg = msg
+        self._current_detail_type = "summary"
         if self._use_html:
+            body_bg = "#1a1a1a" if self._dark_theme else "#fff"
+            body_fg = "#ffffff" if self._dark_theme else "#212121"
             html_msg = (
-                '<html><body style="font-family:Segoe UI, sans-serif; background:#fff; color:#212121; padding:12px;">'
+                f'<html><body style="font-family:Segoe UI, sans-serif; background:{body_bg}; color:{body_fg}; padding:12px;">'
                 f'<p style="margin:0; font-weight:bold;">{html.escape(msg)}</p></body></html>'
             )
-            self._set_detail_content(html_content=html_msg)
+            self._set_detail_content(html_content=html_msg, _detail_type="summary", _detail_data=msg)
         else:
             self._set_detail_content(plain_text=msg)
         self._update_open_in_unity_visibility()
@@ -946,7 +1238,7 @@ class PackageViewerApp:
                 try:
                     data = json.loads(info_path.read_text(encoding="utf-8"))
                     if self._use_html:
-                        self._set_detail_content(html_content=format_info_html(data, extra_notice="※ 未下载：下载目录中无此文件。"))
+                        self._set_detail_content(html_content=format_info_html(data, extra_notice="※ 未下载：下载目录中无此文件。", dark=self._dark_theme))
                     else:
                         self._set_detail_content(plain_text=f"※ 未下载：下载目录中无此文件。\n\n{format_info(data)}")
                 except Exception:
@@ -964,7 +1256,7 @@ class PackageViewerApp:
         try:
             data = json.loads(info_path.read_text(encoding="utf-8"))
             if self._use_html:
-                self._set_detail_content(html_content=format_info_html(data))
+                self._set_detail_content(html_content=format_info_html(data, dark=self._dark_theme), _detail_type="package", _detail_data=data)
             else:
                 self._set_detail_content(plain_text=format_info(data))
             self._update_open_in_unity_visibility()
