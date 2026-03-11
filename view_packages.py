@@ -4,10 +4,11 @@
 import html
 import json
 import os
-from datetime import datetime
 import re
 import subprocess
 import sys
+import webbrowser
+from datetime import datetime
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -31,6 +32,7 @@ else:
 
 CONFIG_PATH = ROOT / "asset_store_config.json"
 PURCHASES_PATH = ROOT / "purchases_snapshot.json"
+PLUGIN_JSON = _BASE / "plugin.json"
 METADATA_DIR = _BASE / "metadata" if not getattr(sys, "frozen", False) else ROOT / "metadata"
 # 图标：打包后从 _MEIPASS 读取；开发时从 build/icon.png 或根目录 icon.png 读取
 if getattr(sys, "frozen", False):
@@ -38,6 +40,39 @@ if getattr(sys, "frozen", False):
 else:
     _icon_candidates = (_BASE / "build" / "icon.png", _BASE / "icon.png")
     ICON_PATH = next((p for p in _icon_candidates if p.exists()), _BASE / "icon.png")
+
+
+def _load_plugins():
+    """从 plugin.json 读取插件配置，返回 (hint, plugins_list)。plugins_list 每项为 {title, command, description}"""
+    default_hint = "以下插件可增强本工具功能，安装后需重启程序生效。"
+    default_plugins = [
+        {"title": "网页风格", "command": "pip install tkinterweb", "description": "包详情以 HTML 形式展示，支持超链接、表格、技术细节等。未安装时将使用纯文本显示。"},
+    ]
+    if not PLUGIN_JSON.exists():
+        return default_hint, default_plugins
+    try:
+        data = json.loads(PLUGIN_JSON.read_text(encoding="utf-8"))
+        hint = data.get("hint") or default_hint
+        raw = data.get("plugins")
+        if not isinstance(raw, list):
+            return default_hint, default_plugins
+        plugins = []
+        for p in raw:
+            if not isinstance(p, dict) or not p.get("title"):
+                continue
+            cmd = p.get("commands")
+            if isinstance(cmd, list) and cmd:
+                cmd = str(cmd[0]) if cmd else ""
+            else:
+                cmd = str(p.get("command", ""))
+            plugins.append({
+                "title": str(p.get("title", "")),
+                "command": cmd,
+                "description": str(p.get("description", "")),
+            })
+        return hint, plugins if plugins else default_plugins
+    except Exception:
+        return default_hint, default_plugins
 
 
 def _load_version() -> str:
@@ -83,6 +118,7 @@ def build_filename_to_package_id(purchases: list) -> dict:
 
 
 def strip_html(html_text: str) -> str:
+    """去除 HTML 标签，转为纯文本（会丢失超链接）"""
     if not html_text:
         return ""
     text = re.sub(r"<br\s*/?>", "\n", html_text, flags=re.I)
@@ -92,9 +128,127 @@ def strip_html(html_text: str) -> str:
     return html.unescape(text).strip()
 
 
+def html_to_safe_html(html_text: str, base_url: str = "https://assetstore.unity.com") -> str:
+    """
+    将描述 HTML 转为安全展示用 HTML，保留超链接。
+    移除 script/iframe 等危险标签，保留 <a href> 并加 target="_blank"。
+    支持 Markdown 链接 [text](url)。
+    """
+    if not html_text:
+        return ""
+    text = html.unescape(html_text)
+    text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.I | re.DOTALL)
+    text = re.sub(r"<iframe[^>]*>.*?</iframe>", "", text, flags=re.I | re.DOTALL)
+    text = re.sub(r"<object[^>]*>.*?</object>", "", text, flags=re.I | re.DOTALL)
+    text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.I | re.DOTALL)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"</p>", "\n", text)
+    text = re.sub(r"</li>", "\n", text)
+    links = []
+
+    def _link_save(m):
+        url = (m.group(1) or "").strip()
+        inner_raw = (m.group(2) or "").strip()
+        inner = strip_html(inner_raw) if inner_raw else ""
+        if not url or url.startswith("javascript:"):
+            return inner_raw or ""
+        if not url.startswith(("http://", "https://")):
+            url = (base_url.rstrip("/") + "/" + url.lstrip("/")) if url.startswith("/") else base_url
+        idx = len(links)
+        links.append((url, inner or inner_raw))
+        return f"\x00LINK{idx}\x00"
+
+    text = re.sub(r'<a\s+[^>]*href\s*=\s*["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>', _link_save, text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    for i, (url, inner) in enumerate(links):
+        text = text.replace(f"\x00LINK{i}\x00", f'<a href="{html.escape(url)}" target="_blank" rel="noopener">{html.escape(inner)}</a>')
+    def _md_link(m):
+        u = (m.group(2) or "").strip()
+        t = (m.group(1) or "").strip()
+        if not u or u.startswith("javascript:"):
+            return m.group(0)
+        if not u.startswith(("http://", "https://")):
+            u = (base_url.rstrip("/") + "/" + u.lstrip("/")) if u.startswith("/") else base_url
+        return f'<a href="{html.escape(u)}" target="_blank" rel="noopener">{html.escape(t)}</a>'
+    text = re.sub(r"\[([^\]]*)\]\(([^)]+)\)", _md_link, text)
+    return text.strip()
+
+
 def _escape_html(text: str) -> str:
     """转义 HTML 特殊字符"""
     return html.escape(str(text or ""), quote=False)
+
+
+def _format_date_official(iso_date: str) -> str:
+    """将 ISO 日期转为官方格式「2025年12月5日」"""
+    if not iso_date or not isinstance(iso_date, str):
+        return str(iso_date or "")
+    s = iso_date.strip()[:10]
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%d")
+        return f"{dt.year}年{dt.month}月{dt.day}日"
+    except (ValueError, TypeError):
+        return s
+
+
+def _format_publish_notes_official(notes_html: str) -> str:
+    """将 publishNotes HTML 转为官方格式：版本号加粗，更新项以 - 列表展示"""
+    if not notes_html:
+        return ""
+    text = strip_html(notes_html)
+    text = html.unescape(text)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    out = []
+    for i, ln in enumerate(lines):
+        if re.match(r'^\d+\.\d+(\.\d+)*$', ln):
+            if out:
+                out.append("<br>")
+            out.append(f'<strong>{_escape_html(ln)}</strong><br>')
+        elif ln.startswith("-"):
+            out.append(f'{_escape_html(ln)}<br>')
+        else:
+            out.append(f'{_escape_html(ln)}<br>')
+    result = "".join(out)
+    if len(result) > 8000:
+        result = result[:8000] + "<br>... (已截断)"
+    return result
+
+
+def _build_srp_compat_table(detail: dict) -> str:
+    """
+    构建「可编程渲染管线 (SRP) 兼容性」表格，与 Unity 官网概述一致。
+    表头：Unity版本 | 内置渲染管线 | 通用渲染管线 (URP) | 高清渲染管线 (HDRP)
+    """
+    uploads = detail.get("uploads") or {}
+    if not isinstance(uploads, dict):
+        return ""
+    compat_cols = [("standard", "内置"), ("lightweight", "URP"), ("hd", "HDRP")]
+    rows = []
+    for unity_ver, info in uploads.items():
+        if not isinstance(info, dict):
+            continue
+        srps = info.get("srps") or []
+        if not isinstance(srps, list):
+            continue
+        srp_set = {str(s).lower() for s in srps}
+        cells = [_escape_html(unity_ver)]
+        seen_urp = False
+        for k, _ in compat_cols:
+            if k in ("lightweight", "urp"):
+                if seen_urp:
+                    continue
+                has = "lightweight" in srp_set or "urp" in srp_set
+                seen_urp = True
+            else:
+                has = k in srp_set
+            cells.append("兼容" if has else "—")
+        rows.append(cells)
+    if not rows:
+        return ""
+    header = '<div class="technical-details"><table><thead><tr><th>Unity版本</th><th>内置渲染管线</th><th>通用渲染管线 (URP)</th><th>高清渲染管线 (HDRP)</th></tr></thead><tbody>'
+    body = "".join(f"<tr>{''.join(f'<td>{c}</td>' for c in r)}</tr>" for r in rows)
+    return header + body + "</tbody></table></div>"
 
 
 def format_info_html(data: dict, extra_notice: str = "", dark: bool = False) -> str:
@@ -116,6 +270,8 @@ def format_info_html(data: dict, extra_notice: str = "", dark: bool = False) -> 
     .notice { background: #3d3d00; color: #e0e0a0; padding: 8px 12px; border-radius: 4px; margin-bottom: 12px; }
     .uploads { margin: 4px 0; }
     .uploads-item { padding: 2px 0; color: #ffffff; }
+    .technical-details table, .rpc table { border-collapse: collapse; margin: 8px 0; }
+    .technical-details td, .rpc td { border: 1px solid #444; padding: 4px 8px; }
     a { color: #7eb8ff; text-decoration: none; }
     a:hover { color: #9ec8ff; text-decoration: underline; }
     """
@@ -142,6 +298,8 @@ def format_info_html(data: dict, extra_notice: str = "", dark: bool = False) -> 
     .notice { background: #fff3cd; color: #856404; padding: 8px 12px; border-radius: 4px; margin-bottom: 12px; }
     .uploads { margin: 4px 0; }
     .uploads-item { padding: 2px 0; color: #212121; }
+    .technical-details table, .rpc table { border-collapse: collapse; margin: 8px 0; }
+    .technical-details td, .rpc td { border: 1px solid #ddd; padding: 4px 8px; }
     a { color: #3a5bc7; text-decoration: none; }
     a:hover { color: #4268e6; text-decoration: underline; }
     """
@@ -168,9 +326,9 @@ def format_info_html(data: dict, extra_notice: str = "", dark: bool = False) -> 
         vname = ver.get("name", "")
         vdate = ver.get("publishedDate", "")
         if vname:
-            parts.append(f'<div class="meta meta-row"><span class="meta-label">版本</span> {_escape_html(vname)}</div>')
+            parts.append(f'<div class="meta meta-row"><span class="meta-label">版本</span> {_escape_html(vname)} (当前版本)</div>')
         if vdate:
-            parts.append(f'<div class="meta meta-row"><span class="meta-label">发布日期</span> {_escape_html(vdate)}</div>')
+            parts.append(f'<div class="meta meta-row"><span class="meta-label">发布时间</span> {_escape_html(_format_date_official(vdate))}</div>')
 
     pub = detail.get("productPublisher", {})
     if isinstance(pub, dict) and pub.get("name"):
@@ -184,42 +342,133 @@ def format_info_html(data: dict, extra_notice: str = "", dark: bool = False) -> 
     if isinstance(cat, dict) and cat.get("name"):
         parts.append(f'<div class="meta meta-row"><span class="meta-label">分类</span> {_escape_html(cat["name"])}</div>')
 
+    loc = detail.get("localizations") or {}
     uploads = detail.get("uploads", {})
     if isinstance(uploads, dict) and uploads:
-        parts.append('<div class="section"><div class="section-title">包大小（按 Unity 版本）</div><div class="uploads">')
+        parts.append('<div class="section"><div class="section-title">资源包内容</div><div class="uploads">')
         for unity_ver, info in uploads.items():
             if isinstance(info, dict):
                 size = info.get("downloadSize", "")
                 count = info.get("assetCount", "")
+                size_str = ""
                 if size:
                     try:
                         size_kb = int(size) / 1024
-                        parts.append(f'<div class="uploads-item">{_escape_html(unity_ver)}: {size_kb:.1f} KB, {_escape_html(str(count))} 个文件</div>')
+                        size_str = f"{size_kb:.1f} KB"
                     except (ValueError, TypeError):
-                        parts.append(f'<div class="uploads-item">{_escape_html(unity_ver)}: {_escape_html(str(size))} bytes</div>')
+                        size_str = f"{size} bytes"
+                count_str = str(count) if count else ""
+                rows = []
+                if size_str:
+                    rows.append(f'文件大小: {size_str}')
+                if count_str:
+                    rows.append(f'文件数量: {count_str}')
+                if rows:
+                    line = " · ".join(rows) if len(uploads) == 1 else f'<span class="meta-label">{_escape_html(unity_ver)}</span> ' + " · ".join(rows)
+                    parts.append(f'<div class="uploads-item">{line}</div>')
         parts.append("</div></div>")
 
+    # 描述前：elevatorPitch（如「FPS 计数器：...」）
+    pitch = None
+    if isinstance(loc, dict) and isinstance(loc.get("zh-CN"), dict):
+        pitch = loc["zh-CN"].get("elevatorPitch")
+    pitch = pitch or detail.get("elevatorPitch")
+    if pitch:
+        pitch_safe = html_to_safe_html(str(pitch))
+        parts.append('<div class="section"><div class="section-title">概述</div><div class="desc">')
+        parts.append(pitch_safe.replace("\n", "<br>"))
+        parts.append("</div></div>")
+
+    # 可编程渲染管线 (SRP) 兼容性表格（与官网概述一致）
+    _srp_table = _build_srp_compat_table(detail)
+    if _srp_table:
+        parts.append('<div class="section"><div class="section-title">可编程渲染管线 (SRP) 兼容性</div>')
+        parts.append(_srp_table)
+        parts.append("</div>")
+    kw = detail.get("keywords") or detail.get("relatedKeywords")
+    if kw:
+        parts.append('<div class="section"><div class="section-title">相关关键词</div><div class="keywords">')
+        if isinstance(kw, list):
+            parts.append(_escape_html(", ".join(str(x) for x in kw)))
+        else:
+            parts.append(_escape_html(str(kw)))
+        parts.append("</div></div>")
+    lnks = detail.get("links") or detail.get("externalLinks") or detail.get("productLinks") or detail.get("productLinksList")
+    if lnks:
+        parts.append('<div class="section"><div class="section-title">链接</div><div class="links">')
+        if isinstance(lnks, list):
+            frags = []
+            for it in lnks:
+                if isinstance(it, dict):
+                    href = it.get("url") or it.get("href") or it.get("link")
+                    lbl = it.get("label") or it.get("name") or it.get("title") or href or ""
+                    if href:
+                        frags.append(f'<a href="{html.escape(str(href), quote=True)}" target="_blank" rel="noopener">{_escape_html(lbl)}</a>')
+                elif isinstance(it, str):
+                    frags.append(_escape_html(it))
+            parts.append(" | ".join(frags))
+        else:
+            parts.append(_escape_html(str(lnks)))
+        parts.append("</div></div>")
     desc = detail.get("description") or ""
     loc = detail.get("localizations", {}).get("zh-CN", {})
     if isinstance(loc, dict) and loc.get("description"):
         desc = loc["description"]
     if desc:
-        desc_plain = strip_html(desc)
-        desc_show = _escape_html(desc_plain[:8000])
-        if len(desc_plain) > 8000:
-            desc_show += "\n... (已截断)"
+        desc_safe = html_to_safe_html(desc)
+        if len(desc_safe) > 8000:
+            desc_safe = desc_safe[:8000] + "\n... (已截断)"
         parts.append('<div class="section"><div class="section-title">描述</div><div class="desc">')
-        parts.append(desc_show.replace("\n", "<br>"))
+        parts.append(desc_safe.replace("\n", "<br>"))
+        parts.append("</div></div>")
+
+    # 技术细节：放在描述后面（与官网一致）
+    _loc_full = detail.get("localizations") or {}
+    _kf = (isinstance(_loc_full, dict) and (_loc_full.get("zh-CN") or {}) or {}).get("keyFeatures") or detail.get("keyFeatures")
+    tech = _kf or detail.get("technicalDetails") or detail.get("renderPipelineCompatibility")
+    if tech:
+        parts.append('<div class="section"><div class="section-title">技术细节</div><div class="technical-details">')
+        if isinstance(tech, str):
+            if tech.strip().startswith("<"):
+                tech_safe = re.sub(r"<script[^>]*>[\s\S]*?</script>", "", tech)
+                tech_safe = re.sub(r"<iframe[^>]*>[\s\S]*?</iframe>", "", tech_safe)
+                tech_safe = tech_safe.replace("</br>", "<br>")
+                parts.append(tech_safe)
+            else:
+                parts.append(_escape_html(tech).replace("\n", "<br>"))
+        elif isinstance(tech, dict):
+            parts.append("<table><tbody>")
+            for k, v in tech.items():
+                parts.append(f"<tr><td>{_escape_html(str(k))}</td><td>{_escape_html(str(v))}</td></tr>")
+            parts.append("</tbody></table>")
+        elif isinstance(tech, list):
+            for item in tech:
+                if isinstance(item, dict):
+                    parts.append("<table><tbody>")
+                    for k, v in item.items():
+                        parts.append(f"<tr><td>{_escape_html(str(k))}</td><td>{_escape_html(str(v))}</td></tr>")
+                    parts.append("</tbody></table>")
+                else:
+                    parts.append(_escape_html(str(item)) + "<br>")
+        else:
+            parts.append(_escape_html(str(tech)))
+        parts.append("</div></div>")
+    rpc = detail.get("renderPipelineCompatibility")
+    if rpc and rpc is not tech:
+        parts.append('<div class="section"><div class="section-title">渲染管线兼容性</div><div class="rpc">')
+        if isinstance(rpc, str):
+            parts.append(rpc if rpc.strip().startswith("<") else _escape_html(rpc).replace("\n", "<br>"))
+        elif isinstance(rpc, (dict, list)):
+            parts.append(_escape_html(str(rpc)).replace("\n", "<br>"))
+        else:
+            parts.append(_escape_html(str(rpc)))
         parts.append("</div></div>")
 
     notes = detail.get("publishNotes") or (loc.get("publishNotes") if isinstance(loc, dict) else "")
     if notes:
-        notes_plain = strip_html(str(notes))
-        notes_show = _escape_html(notes_plain[:3000])
-        if len(notes_plain) > 3000:
-            notes_show += "\n... (已截断)"
+        notes_html = _format_publish_notes_official(str(notes))
         parts.append('<div class="section"><div class="section-title">更新说明</div><div class="notes">')
-        parts.append(notes_show.replace("\n", "<br>"))
+        parts.append(notes_html)
         parts.append("</div></div>")
 
     parts.append("</body></html>")
@@ -274,6 +523,15 @@ def format_info(data: dict) -> str:
                     except (ValueError, TypeError):
                         lines.append(f"  {unity_ver}: {size} bytes")
 
+    tech = detail.get("technicalDetails") or detail.get("renderPipelineCompatibility")
+    if tech:
+        lines.append("\n--- 技术细节 ---")
+        lines.append(tech if isinstance(tech, str) else str(tech))
+    kw = detail.get("keywords") or detail.get("relatedKeywords")
+    if kw:
+        lines.append("\n--- 相关关键词 ---")
+        lines.append(", ".join(str(x) for x in kw) if isinstance(kw, list) else str(kw))
+
     desc = detail.get("description") or ""
     loc = detail.get("localizations", {}).get("zh-CN", {})
     if isinstance(loc, dict) and loc.get("description"):
@@ -321,6 +579,15 @@ class PackageViewerApp:
         self.fetch_running = False
 
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+    def _on_closing(self):
+        """关闭窗口时若正在获取则先停止，确保进程能退出"""
+        if getattr(self, "fetch_running", False):
+            self._fetch_stop_requested = True
+        self.root.destroy()
+        if getattr(sys, "frozen", False):
+            os._exit(0)  # 打包 exe 时强制退出，避免残留进程
 
     def _set_icon(self):
         if not ICON_PATH.exists():
@@ -478,8 +745,24 @@ class PackageViewerApp:
         self._theme_frames_bg.extend([right_frame, self.detail_container, self.filter_container])
 
         self._use_html = HAS_HTML_FRAME
+        if not self._use_html:
+            _no_html_hint = tk.Frame(self.detail_container, bg=self._web_bg, pady=4)
+            _no_html_hint.pack(fill=tk.X)
+            ttk.Label(
+                _no_html_hint,
+                style="Web.TLabel",
+                text="(未检测到 tkinterweb，当前为纯文本模式。运行 pip install tkinterweb 后可显示可点击超链接与「返回文档」按钮)",
+                foreground=self._web_fg_muted,
+                font=("Segoe UI", 9),
+            ).pack(side=tk.LEFT, anchor=tk.W)
+            self._theme_frames_bg.append(_no_html_hint)
         if self._use_html:
-            self.detail_widget = HtmlFrame(self.detail_container, messages_enabled=False)
+            self.detail_widget = HtmlFrame(
+                self.detail_container,
+                messages_enabled=False,
+                selection_enabled=False,  # 避免 Python 3.14 与 tkinterweb 选择管理器的 str/int 比较崩溃
+                on_link_click=lambda url: webbrowser.open(url),
+            )
             self.detail_widget.pack(fill=tk.BOTH, expand=True)
         else:
             self.detail_widget = scrolledtext.ScrolledText(
@@ -490,10 +773,9 @@ class PackageViewerApp:
             )
             self.detail_widget.pack(fill=tk.BOTH, expand=True)
 
-        # 嵌入详情区域内部的右上角：在Unity中打开（深蓝细描边、白底）；仅选中已下载资源时显示
+        # 嵌入详情区域内部的右上角：返回文档、在Unity中打开
         _open_btn_border = "#1565c0"
         self._open_in_unity_frame = tk.Frame(self.detail_container, bg=_open_btn_border, padx=1, pady=1)
-        # 往左靠一点，不贴最右侧（右边缘距右约 80px）
         self._open_in_unity_frame.place(relx=1, rely=0, x=-32, y=36, anchor=tk.NE)
         self._open_in_unity_frame.lift()
         self._open_in_unity_btn = tk.Button(
@@ -512,7 +794,28 @@ class PackageViewerApp:
             cursor="hand2",
         )
         self._open_in_unity_btn.pack()
-        self._update_open_in_unity_visibility()  # 初始不显示，等有选中且已下载再显示
+        self._update_open_in_unity_visibility()
+
+        self._back_to_doc_frame = tk.Frame(self.detail_container, bg=_open_btn_border, padx=1, pady=1)
+        self._back_to_doc_frame.place(relx=1, rely=0, x=-160, y=36, anchor=tk.NE)
+        self._back_to_doc_frame.lift()
+        self._back_to_doc_btn = tk.Button(
+            self._back_to_doc_frame,
+            text="返回文档",
+            command=self._back_to_document,
+            font=("Segoe UI", 10),
+            bg="#ffffff",
+            fg="#212121",
+            activebackground="#f5f5f5",
+            activeforeground="#212121",
+            relief=tk.FLAT,
+            bd=0,
+            padx=12,
+            pady=6,
+            cursor="hand2",
+        )
+        self._back_to_doc_btn.pack()
+        self._update_back_to_doc_visibility()
 
         self._build_filter_panel()
         self._main_sash_set = False
@@ -532,7 +835,7 @@ class PackageViewerApp:
             tab2_hint_row,
             style="Web.TLabel",
             text="根据 purchases_snapshot.json 文件获取每个包的详情到 metadata 目录，"
-            "请保证已经执行过 unity_assets_downloader.py 的「拉取已购买资产列表」阶段。",
+            "请保证已经执行过 unity_assets_downloader.py 的「获取已购买资产列表」阶段。",
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, anchor=tk.W)
         fetch_row = tk.Frame(self._tab2_container, bg=self._web_bg)
         fetch_row.pack(fill=tk.X, pady=4)
@@ -568,6 +871,23 @@ class PackageViewerApp:
             cursor="hand2",
         )
         self.fetch_btn.pack(side=tk.LEFT, padx=4)
+        self._fetch_stop_btn = tk.Button(
+            fetch_row,
+            text="停止",
+            command=self._stop_fetch,
+            font=("Segoe UI", 10),
+            bg=self._THEME_LIGHT["btn_bg"],
+            fg=self._web_fg,
+            activebackground=self._THEME_LIGHT["btn_active"],
+            activeforeground=self._web_fg,
+            relief=tk.FLAT,
+            padx=10,
+            pady=4,
+            cursor="hand2",
+            state=tk.DISABLED,
+        )
+        self._fetch_stop_btn.pack(side=tk.LEFT, padx=4)
+        self._fetch_stop_requested = False
         self.fetch_status = ttk.Label(fetch_row, text="", style="Web.TLabel")
         self.fetch_status.pack(side=tk.LEFT, padx=8)
 
@@ -590,6 +910,89 @@ class PackageViewerApp:
         self.fetch_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         fetch_log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.fetch_log.bind("<MouseWheel>", lambda e: self.fetch_log.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+
+        # Tab 3: 插件
+        tab3 = ttk.Frame(notebook, style="Web.TFrame", padding=8)
+        notebook.add(tab3, text="插件")
+        self._tab3_container = tk.Frame(tab3, bg=self._web_bg)
+        self._tab3_container.pack(fill=tk.BOTH, expand=True)
+        self._theme_frames_bg.append(self._tab3_container)
+
+        plugins_hint, plugins_data = _load_plugins()
+        tab3_hint = tk.Frame(self._tab3_container, bg=self._web_bg)
+        tab3_hint.pack(fill=tk.X, pady=(0, 12))
+        self._theme_frames_bg.append(tab3_hint)
+        ttk.Label(
+            tab3_hint,
+            style="Web.TLabel",
+            text=plugins_hint,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, anchor=tk.W)
+
+        tab3_canvas = tk.Canvas(self._tab3_container, highlightthickness=0, bg=self._web_bg)
+        tab3_scroll = ttk.Scrollbar(self._tab3_container, command=tab3_canvas.yview)
+        tab3_inner = tk.Frame(tab3_canvas, bg=self._web_bg)
+        def _on_inner_configure(e):
+            tab3_canvas.configure(scrollregion=tab3_canvas.bbox("all"))
+        tab3_inner.bind("<Configure>", _on_inner_configure)
+        _plug_win_id = tab3_canvas.create_window((0, 0), window=tab3_inner, anchor=tk.NW)
+        def _on_canvas_configure(e):
+            if e.width > 1:
+                tab3_canvas.itemconfig(_plug_win_id, width=e.width)
+        tab3_canvas.bind("<Configure>", _on_canvas_configure)
+        tab3_canvas.configure(yscrollcommand=tab3_scroll.set)
+        tab3_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tab3_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        def _plug_wheel(e):
+            tab3_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        tab3_canvas.bind("<MouseWheel>", _plug_wheel)
+        self._theme_frames_bg.extend([tab3_canvas, tab3_inner])
+
+        self._plugin_cards = []
+        self._plugin_entries = []
+        for p in plugins_data:
+            name = p.get("title", "")
+            cmd = p.get("command", "")
+            desc = p.get("description", "")
+            card = tk.Frame(tab3_inner, bg=self._web_card_bg, padx=12, pady=10)
+            card.pack(fill=tk.X, pady=6)
+            self._plugin_cards.append(card)
+
+            row1 = tk.Frame(card, bg=self._web_card_bg)
+            row1.pack(fill=tk.X)
+            ttk.Label(row1, text=name, style="Web.Card.TLabel", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+            cmd_entry = tk.Entry(
+                row1, width=50, font=("Consolas", 9),
+                bg=self._THEME_LIGHT["entry_bg"], fg=self._web_fg,
+                insertbackground=self._web_fg, relief=tk.FLAT,
+                highlightthickness=1, highlightcolor=self._web_border, highlightbackground=self._web_border,
+            )
+            cmd_entry.insert(0, cmd)
+            cmd_entry.config(state="readonly")
+            cmd_entry.pack(side=tk.LEFT, padx=(12, 8), ipady=4, ipadx=6)
+
+            def _copy_cmd(c=cmd):
+                self.root.clipboard_clear()
+                self.root.clipboard_append(c)
+                self.root.update()
+
+            copy_btn = tk.Button(
+                row1, text="复制", command=_copy_cmd,
+                font=("Segoe UI", 9),
+                bg=self._THEME_LIGHT["btn_bg"], fg=self._web_fg,
+                activebackground=self._THEME_LIGHT["btn_active"], activeforeground=self._web_fg,
+                relief=tk.FLAT, padx=8, pady=2, cursor="hand2",
+            )
+            copy_btn.pack(side=tk.LEFT)
+            self._plugin_entries.append(cmd_entry)
+            self._plugin_copy_btns = getattr(self, "_plugin_copy_btns", [])
+            self._plugin_copy_btns.append(copy_btn)
+
+            row2 = tk.Frame(card, bg=self._web_card_bg)
+            row2.pack(fill=tk.X, pady=(4, 0))
+            desc_lbl = ttk.Label(row2, text=desc, style="Web.Card.TLabel", foreground=self._web_fg_muted)
+            desc_lbl.pack(anchor=tk.W)
+            self._plugin_desc_labels = getattr(self, "_plugin_desc_labels", [])
+            self._plugin_desc_labels.append(desc_lbl)
 
         # 切换到「获取包商店信息」页签时不把焦点给限制数量输入框
         self._notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
@@ -632,6 +1035,27 @@ class PackageViewerApp:
             # 延迟设置 sash，使类型列固定较窄（约 220px），发行商列露出足够空间和滚动条
             self.root.after(80, self._set_filter_sash)
 
+    def _update_back_to_doc_visibility(self):
+        """当 viewing package detail 且使用 HtmlFrame 时显示「返回文档」按钮"""
+        frame = getattr(self, "_back_to_doc_frame", None)
+        if not frame or not frame.winfo_exists():
+            return
+        if (
+            getattr(self, "_use_html", False)
+            and getattr(self, "_current_detail_type", None) == "package"
+            and getattr(self, "_current_detail_data", None)
+        ):
+            frame.place(relx=1, rely=0, x=-160, y=36, anchor=tk.NE)
+            frame.lift()
+        else:
+            frame.place_forget()
+
+    def _back_to_document(self):
+        """返回包详情文档页"""
+        ddata = getattr(self, "_current_detail_data", None)
+        if ddata and getattr(self, "_use_html", False):
+            self.detail_widget.load_html(format_info_html(ddata, dark=self._dark_theme))
+
     def _update_open_in_unity_visibility(self):
         """仅当有选中且选中项为已下载资源时显示「在Unity中打开」按钮"""
         frame = getattr(self, "_open_in_unity_frame", None)
@@ -640,14 +1064,17 @@ class PackageViewerApp:
         sel = self.listbox.curselection()
         if not sel:
             frame.place_forget()
+            self._update_back_to_doc_visibility()
             return
         idx = sel[0]
         item = self.listbox_map.get(idx)
         if item is None or isinstance(item, dict):
             frame.place_forget()
+            self._update_back_to_doc_visibility()
             return
         frame.place(relx=1, rely=0, x=-32, y=36, anchor=tk.NE)
         frame.lift()
+        self._update_back_to_doc_visibility()
 
     def _open_in_unity(self):
         """将当前选中的 .unitypackage 在 Unity 中打开导入（与 import_assets_to_unity.py 一致：先检查 Unity 是否运行，再 os.startfile）"""
@@ -757,6 +1184,8 @@ class PackageViewerApp:
             self._theme_btn.config(bg=self._web_bg, fg=theme_fg, text=theme_text)
         if getattr(self, "_open_in_unity_frame", None) and self._open_in_unity_frame.winfo_exists():
             self._open_in_unity_btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
+        if getattr(self, "_back_to_doc_frame", None) and self._back_to_doc_frame.winfo_exists():
+            self._back_to_doc_btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
         if getattr(self, "_filter_clear_btn", None) and self._filter_clear_btn.winfo_exists():
             self._filter_clear_btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
         for name in ("_filter_search_row", "_filter_type_frame", "_filter_type_canvas", "_filter_pub_frame", "_filter_pub_canvas", "_filter_pub_inner"):
@@ -776,8 +1205,25 @@ class PackageViewerApp:
             self._limit_entry.config(bg=t["entry_bg"], fg=self._web_fg, insertbackground=self._web_fg, highlightcolor=self._web_border, highlightbackground=self._web_border)
         if getattr(self, "fetch_btn", None) and self.fetch_btn.winfo_exists():
             self.fetch_btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
+        if getattr(self, "_fetch_stop_btn", None) and self._fetch_stop_btn.winfo_exists():
+            self._fetch_stop_btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
         if getattr(self, "fetch_log", None) and self.fetch_log.winfo_exists():
             self.fetch_log.config(bg=self._web_card_bg, fg=self._web_fg)
+        for card in getattr(self, "_plugin_cards", []):
+            if card.winfo_exists():
+                card.config(bg=self._web_card_bg)
+                for child in card.winfo_children():
+                    if child.winfo_exists():
+                        child.config(bg=self._web_card_bg)
+        for e in getattr(self, "_plugin_entries", []):
+            if e and e.winfo_exists():
+                e.config(bg=t["entry_bg"], fg=self._web_fg, insertbackground=self._web_fg, highlightcolor=self._web_border, highlightbackground=self._web_border)
+        for btn in getattr(self, "_plugin_copy_btns", []):
+            if btn and btn.winfo_exists():
+                btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
+        for lbl in getattr(self, "_plugin_desc_labels", []):
+            if lbl and lbl.winfo_exists():
+                lbl.config(foreground=self._web_fg_muted)
         if not getattr(self, "_use_html", True) and getattr(self, "detail_widget", None) and self.detail_widget.winfo_exists():
             self.detail_widget.config(bg=self._web_card_bg, fg=self._web_fg)
         # 主题切换后按当前类型重绘详情区（包详情 / 摘要），使 HTML 随主题变色
@@ -1269,6 +1715,9 @@ class PackageViewerApp:
         self.fetch_log.see(tk.END)
         self.fetch_log.update_idletasks()
 
+    def _stop_fetch(self):
+        self._fetch_stop_requested = True
+
     def _start_fetch(self):
         if self.fetch_running:
             return
@@ -1277,7 +1726,9 @@ class PackageViewerApp:
         except (ValueError, tk.TclError):
             limit = 0
         self.fetch_running = True
+        self._fetch_stop_requested = False
         self.fetch_btn.config(state=tk.DISABLED)
+        self._fetch_stop_btn.config(state=tk.NORMAL)
         self.fetch_status.config(text="获取中...")
         self.fetch_log.delete(1.0, tk.END)
         self._log(f"开始获取 (限制={limit or '全部'})...")
@@ -1287,11 +1738,15 @@ class PackageViewerApp:
                 from fetch_package_info import run_fetch
 
                 def cb(i, total, pid, name, ok, status="ok"):
-                    tag = "OK" if status == "ok" else ("SKIP" if status == "skipped" else "FAIL")
+                    tag = ("OK" if status == "ok" else ("SKIP" if status == "skipped" else "FAIL")).ljust(4)
                     msg = f"[{tag}] ({i}/{total}) {pid} {name}"
                     self.root.after(0, lambda m=msg: self._log(m))
 
-                success, failed, skipped = run_fetch(limit=limit, progress_callback=cb)
+                success, failed, skipped = run_fetch(
+                    limit=limit,
+                    progress_callback=cb,
+                    stop_check=lambda: getattr(self, "_fetch_stop_requested", False),
+                )
                 self.root.after(0, lambda: self._fetch_done(success, failed, skipped))
             except Exception as e:
                 err = str(e)
@@ -1302,12 +1757,19 @@ class PackageViewerApp:
     def _fetch_done(self, success: int, failed: int, skipped: int = 0):
         self.fetch_running = False
         self.fetch_btn.config(state=tk.NORMAL)
-        self.fetch_status.config(text=f"完成: 成功={success}, 失败={failed}, 跳过={skipped}")
-        self._log(f"\n[DONE] 成功={success}, 失败={failed}, 跳过已有={skipped} 个, 元数据库目录={METADATA_DIR}")
+        self._fetch_stop_btn.config(state=tk.DISABLED)
+        stopped = getattr(self, "_fetch_stop_requested", False)
+        status_text = "已停止" if stopped else f"完成: 成功={success}, 失败={failed}, 跳过={skipped}"
+        self.fetch_status.config(text=status_text)
+        if stopped:
+            self._log(f"\n[STOPPED] 用户停止获取，已处理 成功={success}, 失败={failed}, 跳过={skipped}")
+        else:
+            self._log(f"\n[DONE] 成功={success}, 失败={failed}, 跳过(无差异)={skipped} 个, 元数据库目录={METADATA_DIR}")
 
     def _fetch_error(self, err: str):
         self.fetch_running = False
         self.fetch_btn.config(state=tk.NORMAL)
+        self._fetch_stop_btn.config(state=tk.DISABLED)
         self.fetch_status.config(text="错误")
         self._log(f"\n[ERROR] {err}")
 

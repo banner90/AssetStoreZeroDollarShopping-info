@@ -6,10 +6,11 @@
 # 抓包确认的路径：/api/product/{ID}，返回 JSON。
 
 import json
+import queue
 import re
 import sys
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -127,8 +128,8 @@ def try_assetstore_api(cookie: str, package_id: int) -> Optional[Dict]:
     return None
 
 
-def try_assetstore_search(cookie: str, query: str) -> Optional[Dict]:
-    """通过 Asset Store 搜索获取包信息"""
+def try_assetstore_search(cookie: str, query: str, package_id: Optional[int] = None) -> Optional[Dict]:
+    """通过 Asset Store 搜索获取包信息，返回与 packageId 匹配的 product 或首个可用结果"""
     if not cookie:
         return None
     session = requests.Session()
@@ -140,20 +141,139 @@ def try_assetstore_search(cookie: str, query: str) -> Optional[Dict]:
     })
     url = "https://assetstore.unity.com/api/search"
     try:
-        resp = session.get(url, params={"q": query[:80], "rows": 5}, timeout=15)
+        resp = session.get(url, params={"q": query[:80], "rows": 10}, timeout=15)
         if resp.status_code != 200:
             return None
         data = resp.json()
         results = data.get("results") or data.get("items") or []
-        if results:
-            return {"searchResults": results[:3], "query": query}
+        for r in results:
+            if not isinstance(r, dict):
+                continue
+            rid = r.get("id") or r.get("packageId") or r.get("package_id")
+            if package_id and str(rid) == str(package_id):
+                return r
+            if r.get("description") or r.get("name") or r.get("displayName"):
+                return r
+        if results and isinstance(results[0], dict):
+            return results[0]
     except Exception:
         pass
     return None
 
 
+def _extract_from_deep(obj: Any, *keys: str) -> Any:
+    """从嵌套 dict 中按多级 key 递归查找，返回第一个非空值"""
+    if obj is None or not isinstance(obj, dict):
+        return None
+    for key in keys:
+        val = obj.get(key)
+        if val is not None:
+            return val
+    for v in obj.values():
+        if isinstance(v, dict):
+            found = _extract_from_deep(v, *keys)
+            if found is not None:
+                return found
+        elif isinstance(v, list) and v and isinstance(v[0], dict):
+            for item in v:
+                found = _extract_from_deep(item, *keys)
+                if found is not None:
+                    return found
+    return None
+
+
+def _find_technical_in_json(obj: Any) -> Any:
+    """在 JSON 中递归查找 technicalDetails/技术细节 相关内容"""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        for k in ("technicalDetails", "technical_details", "technicalDetailsHtml"):
+            v = obj.get(k)
+            if v is not None and (isinstance(v, str) and len(v) > 10 or isinstance(v, (dict, list))):
+                return v
+        for v in obj.values():
+            r = _find_technical_in_json(v)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for item in obj:
+            r = _find_technical_in_json(item)
+            if r is not None:
+                return r
+    return None
+
+
+def _normalize_next_data_to_detail(next_data: Dict) -> Dict:
+    """将 __NEXT_DATA__ 解析为与 API detail 一致的归一化结构，提取技术详情、超链接等"""
+    out: Dict[str, Any] = {}
+    props = next_data.get("props") or {}
+    page_props = props.get("pageProps") or props
+    product = page_props.get("product") or page_props.get("package") or page_props
+
+    def _walk(obj: Any, target: Dict, key_map: Dict[str, tuple]) -> None:
+        if obj is None:
+            return
+        if isinstance(obj, dict):
+            for our_key, api_keys in key_map.items():
+                if our_key in target and target[our_key]:
+                    continue
+                for k in api_keys:
+                    v = obj.get(k)
+                    if v is not None:
+                        target[our_key] = v
+                        break
+            for v in obj.values():
+                _walk(v, target, key_map)
+
+    key_map = {
+        "name": ("name", "displayName", "title"),
+        "description": ("description", "shortDescription", "fullDescription"),
+        "elevatorPitch": ("elevatorPitch", "elevator_pitch", "shortDescription"),
+        "keyFeatures": ("keyFeatures", "key_features", "keyFeaturesHtml"),
+        "technicalDetails": ("technicalDetails", "technical_details", "technicalDetailsHtml"),
+        "renderPipelineCompatibility": ("renderPipelineCompatibility", "compatibility", "pipelineCompatibility"),
+        "keywords": ("keywords", "relatedKeywords", "tags"),
+        "version": ("version",),
+        "category": ("category",),
+        "productPublisher": ("productPublisher", "publisher"),
+        "publishNotes": ("publishNotes", "releaseNotes"),
+        "localizations": ("localizations",),
+        "uploads": ("uploads",),
+        "links": ("links", "externalLinks", "productLinks", "productLinksList"),
+    }
+    _walk(product, out, key_map)
+    _walk(page_props, out, key_map)
+    _walk(next_data, out, key_map)
+
+    if not out.get("technicalDetails"):
+        td = _extract_from_deep(
+            page_props, "technicalDetails", "technical_details", "technicalDetailsHtml"
+        ) or _find_technical_in_json(next_data)
+        if td is not None:
+            out["technicalDetails"] = td if isinstance(td, (str, dict, list)) else str(td)
+    if not out.get("technicalDetails") and isinstance(product, dict):
+        for s in product.get("sections") or product.get("productSections") or []:
+            if not isinstance(s, dict):
+                continue
+            st = str(s.get("type") or s.get("title") or "").lower()
+            if "technical" in st or "细节" in st:
+                c = s.get("content") or s.get("html") or s.get("body")
+                if c:
+                    out["technicalDetails"] = c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)
+                    break
+
+    if not out.get("renderPipelineCompatibility"):
+        rpc = _extract_from_deep(page_props, "renderPipelineCompatibility", "compatibility", "pipelineCompatibility")
+        if rpc is not None:
+            out["renderPipelineCompatibility"] = rpc
+
+    if not out and isinstance(product, dict):
+        out = dict(product)
+    return out
+
+
 def try_assetstore_html(cookie: str, package_id: int, display_name: str) -> Optional[Dict]:
-    """尝试从 Asset Store 页面 HTML 中解析 __NEXT_DATA__ 或描述文本"""
+    """尝试从 Asset Store 页面 HTML 中解析 __NEXT_DATA__，提取技术详情、描述（含超链接）等"""
     if not cookie:
         return None
     session = requests.Session()
@@ -166,34 +286,181 @@ def try_assetstore_html(cookie: str, package_id: int, display_name: str) -> Opti
         ),
         "Cookie": cookie,
     })
-    # 尝试用 packageId 直接访问（部分站点支持 /packages/xxx/xxx-{id}）
     slug = re.sub(r"[^a-z0-9]+", "-", display_name.lower())[:50].strip("-")
     urls = [
         f"https://assetstore.unity.com/packages/-/-{package_id}",
         f"https://assetstore.unity.com/packages/0/{package_id}",
+        f"https://assetstore.unity.com/packages/tools/utilities/{slug}-{package_id}",
+        f"https://assetstore.unity.com/packages/tools/{slug}-{package_id}",
     ]
     for url in urls:
         try:
-            resp = session.get(url, timeout=10, allow_redirects=True)
+            resp = session.get(url, timeout=15, allow_redirects=True)
             if resp.status_code != 200:
                 continue
             html = resp.text
-            # 尝试解析 __NEXT_DATA__
-            m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>', html)
+            m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>', html, re.DOTALL)
             if m:
                 try:
-                    data = json.loads(m.group(1))
-                    return data
+                    raw = json.loads(m.group(1))
+                    detail = _normalize_next_data_to_detail(raw)
+                    if detail and (detail.get("description") or detail.get("name") or detail.get("displayName")):
+                        return detail
+                    pp = (raw.get("props") or {}).get("pageProps") or {}
+                    product = pp.get("product") or pp.get("package")
+                    if isinstance(product, dict) and (product.get("description") or product.get("name")):
+                        return product
                 except Exception:
                     pass
-            # 尝试解析其他内联 JSON
+            for pat in [
+                r'[Tt]echnical[Dd]etails["\']?\s*:\s*["\']([^"\']*(?:\\.[^"\']*)*)["\']',
+                r'"technicalDetails"\s*:\s*"((?:[^"\\]|\\.)*)"',
+                r'technicalDetailsHtml["\']?\s*:\s*["\']([^"\']*(?:\\.[^"\']*)*)["\']',
+            ]:
+                td = re.search(pat, html)
+                if td:
+                    try:
+                        raw_val = td.group(1)
+                        desc = raw_val.encode("utf-8").decode("unicode_escape")
+                        if len(desc) > 20:
+                            return {"technicalDetails": desc, "source": "html_parse"}
+                    except Exception:
+                        pass
+            collap = re.search(
+                r'(?:技术细节|Technical\s+Details)[^<]*</[^>]+>[\s\S]*?<(?:div|section)[^>]*>([\s\S]*?)</(?:div|section)>',
+                html,
+                re.I,
+            )
+            if collap:
+                frag = re.sub(r"<script[^>]*>[\s\S]*?</script>", "", collap.group(1))
+                frag = re.sub(r"<style[^>]*>[\s\S]*?</style>", "", frag)
+                if len(frag.strip()) > 30:
+                    base = {"technicalDetails": frag.strip(), "source": "html_parse"}
+                    m = re.search(r'"description"\s*:\s*"([^"]*(?:\\.[^"]*)*)"', html)
+                    if m:
+                        try:
+                            base["description"] = m.group(1).encode("utf-8").decode("unicode_escape")
+                        except Exception:
+                            pass
+                    return base
             m = re.search(r'"description"\s*:\s*"([^"]*(?:\\.[^"]*)*)"', html)
             if m:
-                desc = m.group(1).encode().decode("unicode_escape")
-                return {"description": desc, "source": "html_parse"}
+                try:
+                    desc = m.group(1).encode("utf-8").decode("unicode_escape")
+                    return {"description": desc, "source": "html_parse"}
+                except Exception:
+                    pass
         except Exception:
             continue
     return None
+
+
+def _technical_details_is_substantial(td: Any) -> bool:
+    """判断 technicalDetails 是否为有意义的实质内容（非空壳 div 或过短占位）"""
+    if not td:
+        return False
+    s = str(td).strip()
+    if len(s) < 50:
+        return False
+    # 排除仅包含空 div 外壳（如 <div class="_1_3uP _1rkJa" data-reactid="312">）
+    stripped = re.sub(r"<[^>]+>", "", s)
+    if len(stripped.strip()) < 20:
+        return False
+    # 有表格或实质文本才算
+    has_table = "<table" in s.lower() or "<tr" in s.lower() or "<td" in s.lower()
+    has_text = re.search(r">[^<\s]{10,}<", s) or len(stripped.strip()) > 30
+    return bool(has_table or has_text)
+
+
+_SRPS_MAP = {
+    "standard": "Built-in Render Pipeline",
+    "hd": "High Definition RP (HDRP)",
+    "lightweight": "Universal RP (URP)",
+    "urp": "Universal RP (URP)",
+    "custom": "Custom SRP",
+}
+
+
+def _build_technical_from_uploads(detail: Dict) -> Optional[str]:
+    """从 supportedUnityVersions、uploads（含 srps）构建技术详情 HTML 表格"""
+    unity_vers = detail.get("supportedUnityVersions")
+    uploads = detail.get("uploads")
+    if not isinstance(uploads, dict):
+        return None
+    rows = []
+    # Unity 版本
+    if isinstance(unity_vers, list) and unity_vers:
+        rows.append(("Supported Unity versions", ", ".join(str(v) for v in unity_vers)))
+    elif isinstance(unity_vers, str) and unity_vers:
+        rows.append(("Supported Unity versions", unity_vers))
+    # 每个 Unity 版本对应的上传信息（含 srps）
+    for unity_ver, info in uploads.items():
+        if not isinstance(info, dict):
+            continue
+        srps = info.get("srps")
+        if isinstance(srps, list) and srps:
+            rp_names = [_SRPS_MAP.get(str(s).lower(), str(s)) for s in srps]
+            rows.append((f"Render Pipelines ({unity_ver})", ", ".join(rp_names)))
+        elif isinstance(srps, str) and srps:
+            rows.append((f"Render Pipeline ({unity_ver})", _SRPS_MAP.get(srps.lower(), srps)))
+    if not rows:
+        return None
+    html_parts = ["<table><tbody>"]
+    for k, v in rows:
+        html_parts.append(f"<tr><td>{_escape_html_attr(str(k))}</td><td>{_escape_html_attr(str(v))}</td></tr>")
+    html_parts.append("</tbody></table>")
+    return "".join(html_parts)
+
+
+def _escape_html_attr(text: str) -> str:
+    """转义 HTML 属性/内容中的特殊字符"""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _enrich_technical_details(detail: Dict) -> None:
+    """当 API 返回的 technicalDetails 为空壳时，从 uploads/supportedUnityVersions 构建"""
+    td = detail.get("technicalDetails")
+    if _technical_details_is_substantial(td):
+        return
+    if td:
+        detail["technicalDetails"] = None
+    built = _build_technical_from_uploads(detail)
+    if built:
+        detail["technicalDetails"] = built
+
+
+def try_enhance_detail_from_html(cookie: str, package_id: int, display_name: str, detail: Dict) -> Dict:
+    """
+    当 API 已有 detail 但缺少技术详情、描述超链接时，用 HTML 页面补充。
+    只填充 detail 中缺失的字段，不覆盖已有内容。
+    """
+    html_detail = try_assetstore_html(cookie, package_id, display_name)
+    if not html_detail or not isinstance(html_detail, dict):
+        return detail
+    if "props" in html_detail:
+        html_detail = _normalize_next_data_to_detail(html_detail)
+    for key in ("technicalDetails", "renderPipelineCompatibility", "keywords", "links", "elevatorPitch", "keyFeatures"):
+        if key in html_detail and html_detail[key] and not detail.get(key):
+            detail[key] = html_detail[key]
+    if html_detail.get("description"):
+        d_has_link = "<a " in (detail.get("description") or "")
+        h_has_link = "<a " in (html_detail.get("description") or "")
+        if not detail.get("description") or (h_has_link and not d_has_link):
+            detail["description"] = html_detail["description"]
+    loc = detail.get("localizations") or {}
+    if isinstance(loc, dict) and not loc.get("zh-CN", {}).get("description"):
+        hloc = html_detail.get("localizations") or {}
+        if isinstance(hloc, dict) and hloc.get("zh-CN"):
+            if "localizations" not in detail:
+                detail["localizations"] = {}
+            detail["localizations"]["zh-CN"] = detail["localizations"].get("zh-CN") or {}
+            detail["localizations"]["zh-CN"]["description"] = hloc["zh-CN"].get("description") or detail["localizations"]["zh-CN"].get("description")
+    return detail
 
 
 def fetch_one_package(
@@ -229,8 +496,9 @@ def fetch_one_package(
         for base in ["https://packages-v2.unity.cn", "https://packages-v2.unity.com"]:
             detail = try_packages_v2(bearer, cookie, pid, base)
             if detail:
-                result["detail"] = detail
+                result["detail"] = try_enhance_detail_from_html(cookie, pid, display_name, detail)
                 result["source"] = f"{base}/-/api/packages"
+                _enrich_technical_details(result["detail"])
                 break
         if result["detail"]:
             return result
@@ -238,15 +506,17 @@ def fetch_one_package(
     # 2. 尝试 assetstore.unity.com API
     detail = try_assetstore_api(cookie, pid)
     if detail:
-        result["detail"] = detail
+        result["detail"] = try_enhance_detail_from_html(cookie, pid, display_name, detail)
         result["source"] = "assetstore.unity.com api"
+        _enrich_technical_details(result["detail"])
         return result
 
     # 3. 尝试 Asset Store 搜索（按 displayName）
-    detail = try_assetstore_search(cookie, display_name)
+    detail = try_assetstore_search(cookie, display_name, pid)
     if detail:
         result["detail"] = detail
         result["source"] = "assetstore.unity.com search"
+        _enrich_technical_details(result["detail"])
         return result
 
     # 4. 尝试从 HTML 页面解析
@@ -254,20 +524,45 @@ def fetch_one_package(
     if detail:
         result["detail"] = detail
         result["source"] = "assetstore.unity.com html"
+        _enrich_technical_details(result["detail"])
         return result
 
     result["error"] = "all sources failed"
     return result
 
 
+def _detail_equal(a: Any, b: Any) -> bool:
+    """比较两个 detail 内容是否一致（忽略键序、无关格式）"""
+    if a is b:
+        return True
+    if a is None or b is None:
+        return a == b
+    try:
+        return json.dumps(a, sort_keys=True, ensure_ascii=False) == json.dumps(b, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return a == b
+
+
+def _detail_is_substantial(detail: Any) -> bool:
+    """判断 detail 是否为可展示的完整结构（含 description/name/version 等）"""
+    if not detail or not isinstance(detail, dict):
+        return False
+    has_core = any(detail.get(k) for k in ("description", "name", "displayName", "version"))
+    has_product = "searchResults" in detail or "props" in detail
+    return bool(has_core) and not has_product
+
+
 def run_fetch(
     limit: int = 0,
     progress_callback: Optional[Callable[..., None]] = None,
     max_workers: int = 6,
+    stop_check: Optional[Callable[[], bool]] = None,
 ) -> tuple[int, int, int]:
     """执行获取。返回 (success, failed, skipped)。
     progress_callback(current, total, package_id, display_name, success, status)
     status: "ok"|"skipped"|"failed"
+    skipped: 内容与已有一致，无需更新
+    stop_check: 返回 True 时立即停止获取
     """
     config = load_config()
     bearer = (config.get("bearer_token") or "").strip()
@@ -282,23 +577,12 @@ def run_fetch(
         purchases = purchases[:limit]
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # 预扫描已有文件（与 unity_assets_downloader 一致：一次性 glob，O(k)，极快）
-    existing_pids = {f.stem for f in OUTPUT_DIR.glob("*.json")}
-    to_fetch = []
-    skipped = 0
-    for i, item in enumerate(purchases, 1):
-        pid = item.get("packageId")
-        if not pid:
-            continue
-        if str(pid) in existing_pids:
-            skipped += 1
-            continue
-        to_fetch.append((i, item))
+    to_fetch = [(i, item) for i, item in enumerate(purchases, 1) if item.get("packageId")]
 
     if not to_fetch:
-        return 0, 0, skipped
+        return 0, 0, 0
 
-    success, failed = 0, 0
+    success, failed, skipped = 0, 0, 0
     total = len(purchases)
 
     def _fetch_task(args):
@@ -306,24 +590,93 @@ def run_fetch(
         pid = item.get("packageId", "?")
         result = fetch_one_package(item, bearer, cookie, config, timeout)
         out_file = OUTPUT_DIR / f"{pid}.json"
+        existing = None
+        if out_file.exists():
+            try:
+                existing = json.loads(out_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        new_detail = result.get("detail")
+        old_detail = existing.get("detail") if existing else None
+        if new_detail and old_detail and _detail_equal(new_detail, old_detail):
+            return i, total, pid, str(item.get("displayName") or "?"), False, "skipped"
+        if not new_detail and old_detail:
+            return i, total, pid, str(item.get("displayName") or "?"), False, "failed"
+        if new_detail and old_detail and _detail_is_substantial(old_detail) and not _detail_is_substantial(new_detail):
+            return i, total, pid, str(item.get("displayName") or "?"), False, "skipped"
         out_file.write_text(
             json.dumps(result, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        ok = bool(result.get("detail"))
+        ok = bool(new_detail)
         return i, total, pid, str(item.get("displayName") or "?"), ok, "ok" if ok else "failed"
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_fetch_task, t): t for t in to_fetch}
-        for future in as_completed(futures):
-            i, tot, pid, name, ok, status = future.result()
-            if ok:
-                success += 1
-            else:
-                failed += 1
-            if progress_callback:
-                progress_callback(i, tot, pid, name, ok, status)
-            time.sleep(0.05)  # 轻微限速，避免请求过快（原 0.5s 导致极慢）
+    task_queue = queue.Queue()
+    result_queue = queue.Queue()
+    _stop = threading.Event()
+
+    def _worker():
+        while not _stop.is_set():
+            try:
+                args = task_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if args is None:
+                break
+            try:
+                r = _fetch_task(args)
+                result_queue.put(r)
+            except Exception:
+                result_queue.put((args[0], total, args[1].get("packageId", "?"), str(args[1].get("displayName", "?")), False, "failed"))
+            finally:
+                task_queue.task_done()
+
+    for t in to_fetch:
+        task_queue.put(t)
+    n_workers = min(max_workers, len(to_fetch))
+    workers = [threading.Thread(target=_worker, daemon=True) for _ in range(n_workers)]
+    for w in workers:
+        w.start()
+
+    stopped = False
+    collected = 0
+    poison_sent = False
+
+    def _send_poison():
+        nonlocal poison_sent
+        if not poison_sent:
+            poison_sent = True
+            for _ in range(n_workers):
+                try:
+                    task_queue.put(None)
+                except Exception:
+                    pass
+
+    while collected < len(to_fetch):
+        if stop_check and stop_check():
+            _stop.set()
+            _send_poison()
+            stopped = True
+            break
+        try:
+            i, tot, pid, name, ok, status = result_queue.get(timeout=0.3)
+        except queue.Empty:
+            continue
+        collected += 1
+        if status == "skipped":
+            skipped += 1
+        elif ok:
+            success += 1
+        else:
+            failed += 1
+        if progress_callback:
+            progress_callback(i, tot, pid, name, ok, status)
+        time.sleep(0.05)
+
+    if not stopped:
+        _send_poison()
+    for w in workers:
+        w.join(timeout=1.0)
 
     return success, failed, skipped
 
@@ -355,11 +708,11 @@ def main() -> int:
         print("[WARN] bearer_token 为空，将跳过 packages-v2 API")
 
     def cb(i, total, pid, name, ok, status="ok"):
-        tag = "OK" if status == "ok" else ("SKIP" if status == "skipped" else "FAIL")
+        tag = ("OK" if status == "ok" else ("SKIP" if status == "skipped" else "FAIL")).ljust(4)
         print(f"[{tag}] ({i}/{total}) {pid} {name}")
 
     success, failed, skipped = run_fetch(limit=limit, progress_callback=cb)
-    print(f"[DONE] 成功={success}, 失败={failed}, 跳过已有={skipped}")
+    print(f"[DONE] 成功={success}, 失败={failed}, 跳过(无差异)={skipped}")
     return 0 if failed == 0 else 2
 
 
