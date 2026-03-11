@@ -1639,6 +1639,8 @@ class PackageViewerApp:
 
         self._filter_type_vars = {}
         self._filter_type_group_frames = {}
+        self._filter_type_children = {}
+        self._filter_type_checkbuttons = {}
         type_counts = self._collect_category_counts()
         if type_counts:
             self._build_type_tree(type_inner, type_counts)
@@ -1727,6 +1729,46 @@ class PackageViewerApp:
                 pass
         return counts
 
+    def _set_type_checkbutton_state(self, name: str, checked: bool = False, partial: bool = False):
+        """同步设置类型筛选复选框的显示状态。partial=True 时显示半勾选。"""
+        var = self._filter_type_vars.get(name)
+        if var is not None:
+            var.set(bool(checked))
+        cb = getattr(self, "_filter_type_checkbuttons", {}).get(name)
+        if cb and cb.winfo_exists():
+            if checked:
+                cb.state(["selected", "!alternate"])
+            elif partial:
+                cb.state(["!selected", "alternate"])
+            else:
+                cb.state(["!selected", "!alternate"])
+
+    def _refresh_type_parent_state(self, parent_name: str):
+        """根据子级勾选情况回推父级：未选 / 半选 / 全选。"""
+        children = getattr(self, "_filter_type_children", {}).get(parent_name, [])
+        if not children:
+            return
+        selected_count = sum(1 for child in children if self._filter_type_vars.get(child) and self._filter_type_vars[child].get())
+        if selected_count <= 0:
+            self._set_type_checkbutton_state(parent_name, checked=False, partial=False)
+        elif selected_count == len(children):
+            self._set_type_checkbutton_state(parent_name, checked=True, partial=False)
+        else:
+            self._set_type_checkbutton_state(parent_name, checked=False, partial=True)
+
+    def _on_type_parent_toggle(self, parent_name: str):
+        """点击父级时，同步全选/取消该父级下的所有子级。"""
+        target = bool(self._filter_type_vars[parent_name].get())
+        for child_name in self._filter_type_children.get(parent_name, []):
+            self._set_type_checkbutton_state(child_name, checked=target, partial=False)
+        self._refresh_type_parent_state(parent_name)
+        self._apply_filter_to_list()
+
+    def _on_type_child_toggle(self, parent_name: str):
+        """点击子级时，更新父级为未选、半选或全选。"""
+        self._refresh_type_parent_state(parent_name)
+        self._apply_filter_to_list()
+
     def _build_type_tree(self, parent, type_counts: dict):
         """将扁平的分类计数构建为可折叠的树形 UI（仿 Unity Asset Store 官网筛选样式）"""
         bg = parent.cget("bg")
@@ -1753,12 +1795,14 @@ class PackageViewerApp:
                 self._filter_type_vars[top_name] = tk.BooleanVar(value=False)
                 row = tk.Frame(parent, bg=bg)
                 row.pack(anchor=tk.W, fill=tk.X, pady=1)
-                ttk.Checkbutton(
+                cb = ttk.Checkbutton(
                     row, text=f"{top_name}",
                     variable=self._filter_type_vars[top_name],
                     command=self._apply_filter_to_list,
                     style="Web.Card.TCheckbutton",
-                ).pack(side=tk.LEFT)
+                )
+                cb.pack(side=tk.LEFT)
+                self._filter_type_checkbuttons[top_name] = cb
                 tk.Label(row, text=f"({cnt})", font=("Segoe UI", 9),
                          bg=bg, fg=fg_count).pack(side=tk.LEFT, padx=(2, 0))
                 continue
@@ -1771,10 +1815,11 @@ class PackageViewerApp:
             cb = ttk.Checkbutton(
                 header, text=f"{top_name}",
                 variable=self._filter_type_vars[top_name],
-                command=self._apply_filter_to_list,
+                command=lambda name=top_name: self._on_type_parent_toggle(name),
                 style="Web.Card.TCheckbutton",
             )
             cb.pack(side=tk.LEFT)
+            self._filter_type_checkbuttons[top_name] = cb
             tk.Label(header, text=f"({node['_total']})", font=("Segoe UI", 9),
                      bg=bg, fg=fg_count).pack(side=tk.LEFT, padx=(2, 0))
 
@@ -1784,6 +1829,7 @@ class PackageViewerApp:
 
             child_frame = tk.Frame(parent, bg=bg)
             self._filter_type_group_frames[top_name] = (arrow_lbl, child_frame, expanded)
+            self._filter_type_children[top_name] = []
 
             top_depth = top_name.count("/") + 1
             for full_name in sorted(children.keys()):
@@ -1792,15 +1838,18 @@ class PackageViewerApp:
                 depth = full_name.count("/") - top_depth + 1
                 indent = max(depth, 1) * 20
                 self._filter_type_vars[full_name] = tk.BooleanVar(value=False)
+                self._filter_type_children[top_name].append(full_name)
                 row = tk.Frame(child_frame, bg=bg)
                 row.pack(anchor=tk.W, fill=tk.X, pady=1)
                 tk.Frame(row, width=indent, bg=bg).pack(side=tk.LEFT)
-                ttk.Checkbutton(
+                cb = ttk.Checkbutton(
                     row, text=f"{display}",
                     variable=self._filter_type_vars[full_name],
-                    command=self._apply_filter_to_list,
+                    command=lambda name=top_name: self._on_type_child_toggle(name),
                     style="Web.Card.TCheckbutton",
-                ).pack(side=tk.LEFT)
+                )
+                cb.pack(side=tk.LEFT)
+                self._filter_type_checkbuttons[full_name] = cb
                 tk.Label(row, text=f"({cnt})", font=("Segoe UI", 9),
                          bg=bg, fg=fg_count).pack(side=tk.LEFT, padx=(2, 0))
 
@@ -1852,8 +1901,8 @@ class PackageViewerApp:
     def _filter_clear(self):
         """清除筛选器：取消所有勾选并清空搜索"""
         self._filter_search_var.set("")
-        for v in self._filter_type_vars.values():
-            v.set(False)
+        for name in self._filter_type_vars.keys():
+            self._set_type_checkbutton_state(name, checked=False, partial=False)
         for v in getattr(self, "_filter_pub_vars", {}).values():
             v.set(False)
         self._filter_pub_search.set("")
