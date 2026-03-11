@@ -43,19 +43,16 @@ else:
 
 
 def _load_plugins():
-    """从 plugin.json 读取插件配置，返回 (hint, plugins_list)。plugins_list 每项为 {title, command, description}"""
-    default_hint = "以下插件可增强本工具功能，安装后需重启程序生效。"
-    default_plugins = [
-        {"title": "网页风格", "command": "pip install tkinterweb", "description": "包详情以 HTML 形式展示，支持超链接、表格、技术细节等。未安装时将使用纯文本显示。"},
-    ]
+    """从 plugin.json 读取插件配置，返回 (hint, plugins_list)。plugins_list 每项为 {title, command, description}。未识别到 json 时返回空列表，不填充默认插件。"""
+    default_hint = "以下插件可增强本工具功能，安装后需重启程序生效。作者会根据实际需要更新插件文件，不需要用户自行修改。"
     if not PLUGIN_JSON.exists():
-        return default_hint, default_plugins
+        return default_hint, []
     try:
         data = json.loads(PLUGIN_JSON.read_text(encoding="utf-8"))
         hint = data.get("hint") or default_hint
         raw = data.get("plugins")
         if not isinstance(raw, list):
-            return default_hint, default_plugins
+            return hint, []
         plugins = []
         for p in raw:
             if not isinstance(p, dict) or not p.get("title"):
@@ -70,9 +67,9 @@ def _load_plugins():
                 "command": cmd,
                 "description": str(p.get("description", "")),
             })
-        return hint, plugins if plugins else default_plugins
+        return hint, plugins
     except Exception:
-        return default_hint, default_plugins
+        return default_hint, []
 
 
 def _load_version() -> str:
@@ -630,6 +627,7 @@ class PackageViewerApp:
         self._web_border = _t["border"]
         try:
             _sty = ttk.Style()
+            _sty.theme_use("clam")  # Windows 下 vista 会忽略 Frame 等背景色，clam 支持自定义
             _sty.configure("Web.TFrame", background=self._web_bg)
             _sty.configure("Web.TLabel", background=self._web_bg, foreground=self._web_fg, font=("Segoe UI", 9))
             _sty.configure("Web.TButton", background=self._THEME_LIGHT["btn_bg"], foreground=self._web_fg, padding=(10, 4))
@@ -637,7 +635,9 @@ class PackageViewerApp:
             _sty.configure("Web.TCheckbutton", background=self._web_bg, foreground=self._web_fg)
             _sty.configure("Web.Card.TLabel", background=self._web_card_bg, foreground=self._web_fg, font=("Segoe UI", 9))
             _sty.configure("Web.Card.TCheckbutton", background=self._web_card_bg, foreground=self._web_fg)
-            _sty.configure("Vertical.TScrollbar", troughrelief="flat")
+            _sb_bg, _sb_trough = (_t["btn_bg"], _t["card"]) if self._dark_theme else ("#b0b0b0", "#e8e8e8")
+            _sty.configure("Vertical.TScrollbar", troughrelief="flat", background=_sb_bg, troughcolor=_sb_trough)
+            _sty.configure("Web.Detail.TFrame", background=self._web_card_bg)
         except Exception:
             pass
 
@@ -751,7 +751,7 @@ class PackageViewerApp:
             ttk.Label(
                 _no_html_hint,
                 style="Web.TLabel",
-                text="(未检测到 tkinterweb，当前为纯文本模式。运行 pip install tkinterweb 后可显示可点击超链接与「返回文档」按钮)",
+                text="(未检测到 tkinterweb，当前为纯文本模式。运行 pip install tkinterweb 后可显示可点击超链接)",
                 foreground=self._web_fg_muted,
                 font=("Segoe UI", 9),
             ).pack(side=tk.LEFT, anchor=tk.W)
@@ -762,6 +762,7 @@ class PackageViewerApp:
                 messages_enabled=False,
                 selection_enabled=False,  # 避免 Python 3.14 与 tkinterweb 选择管理器的 str/int 比较崩溃
                 on_link_click=lambda url: webbrowser.open(url),
+                style="Web.Detail.TFrame",
             )
             self.detail_widget.pack(fill=tk.BOTH, expand=True)
         else:
@@ -770,6 +771,8 @@ class PackageViewerApp:
                 wrap=tk.WORD,
                 font=("Segoe UI", 10),
                 state=tk.DISABLED,
+                bg=self._web_card_bg,
+                fg=self._web_fg,
             )
             self.detail_widget.pack(fill=tk.BOTH, expand=True)
 
@@ -842,14 +845,17 @@ class PackageViewerApp:
         self._theme_frames_bg.append(fetch_row)
         ttk.Label(fetch_row, text="限制数量 (0=全部):", style="Web.TLabel").pack(side=tk.LEFT)
         self.limit_var = tk.IntVar(value=0)
+        _t2 = self._THEME_DARK if self._dark_theme else self._THEME_LIGHT
         self._limit_entry = tk.Entry(
             fetch_row,
             textvariable=self.limit_var,
             width=10,
             font=("Segoe UI", 10),
-            bg=self._THEME_LIGHT["entry_bg"],
+            bg=_t2["entry_bg"],
             fg=self._web_fg,
             insertbackground=self._web_fg,
+            selectbackground=self._web_select_bg,
+            selectforeground=self._web_fg,
             relief=tk.FLAT,
             highlightthickness=1,
             highlightcolor=self._web_border,
@@ -931,24 +937,38 @@ class PackageViewerApp:
         tab3_canvas = tk.Canvas(self._tab3_container, highlightthickness=0, bg=self._web_bg)
         tab3_scroll = ttk.Scrollbar(self._tab3_container, command=tab3_canvas.yview)
         tab3_inner = tk.Frame(tab3_canvas, bg=self._web_bg)
-        def _on_inner_configure(e):
-            tab3_canvas.configure(scrollregion=tab3_canvas.bbox("all"))
-        tab3_inner.bind("<Configure>", _on_inner_configure)
         _plug_win_id = tab3_canvas.create_window((0, 0), window=tab3_inner, anchor=tk.NW)
-        def _on_canvas_configure(e):
+        def _plug_inner_configure(e):
+            b = tab3_canvas.bbox("all")
+            tab3_canvas.configure(scrollregion=tab3_canvas.bbox("all"))
+            w = tab3_canvas.winfo_width()
+            ch = tab3_canvas.winfo_height()
+            content_h = (b[3] - b[1]) if b else 0
+            if w > 1:
+                tab3_canvas.itemconfig(_plug_win_id, width=w)
+            tab3_canvas.itemconfig(_plug_win_id, height=max(content_h, ch) if ch > 0 else content_h)
+        tab3_inner.bind("<Configure>", _plug_inner_configure)
+        def _plug_canvas_configure(e):
             if e.width > 1:
                 tab3_canvas.itemconfig(_plug_win_id, width=e.width)
-        tab3_canvas.bind("<Configure>", _on_canvas_configure)
+            if e.height > 1:
+                b = tab3_canvas.bbox("all")
+                content_h = (b[3] - b[1]) if b else e.height
+                tab3_canvas.itemconfig(_plug_win_id, height=max(content_h, e.height))
+        tab3_canvas.bind("<Configure>", _plug_canvas_configure)
         tab3_canvas.configure(yscrollcommand=tab3_scroll.set)
         tab3_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tab3_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         def _plug_wheel(e):
-            tab3_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            b = tab3_canvas.bbox("all")
+            if b and tab3_canvas.winfo_height() > 0 and (b[3] - b[1]) > tab3_canvas.winfo_height():
+                tab3_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
         tab3_canvas.bind("<MouseWheel>", _plug_wheel)
         self._theme_frames_bg.extend([tab3_canvas, tab3_inner])
 
         self._plugin_cards = []
         self._plugin_entries = []
+        _t_plug = self._THEME_DARK if self._dark_theme else self._THEME_LIGHT
         for p in plugins_data:
             name = p.get("title", "")
             cmd = p.get("command", "")
@@ -961,10 +981,19 @@ class PackageViewerApp:
             row1.pack(fill=tk.X)
             ttk.Label(row1, text=name, style="Web.Card.TLabel", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
             cmd_entry = tk.Entry(
-                row1, width=50, font=("Consolas", 9),
-                bg=self._THEME_LIGHT["entry_bg"], fg=self._web_fg,
-                insertbackground=self._web_fg, relief=tk.FLAT,
-                highlightthickness=1, highlightcolor=self._web_border, highlightbackground=self._web_border,
+                row1,
+                width=50,
+                font=("Consolas", 9),
+                bg=_t_plug["entry_bg"],
+                fg=self._web_fg,
+                insertbackground=self._web_fg,
+                readonlybackground=_t_plug["entry_bg"],
+                selectbackground=self._web_select_bg,
+                selectforeground=self._web_fg,
+                relief=tk.FLAT,
+                highlightthickness=1,
+                highlightcolor=self._web_border,
+                highlightbackground=self._web_border,
             )
             cmd_entry.insert(0, cmd)
             cmd_entry.config(state="readonly")
@@ -978,8 +1007,8 @@ class PackageViewerApp:
             copy_btn = tk.Button(
                 row1, text="复制", command=_copy_cmd,
                 font=("Segoe UI", 9),
-                bg=self._THEME_LIGHT["btn_bg"], fg=self._web_fg,
-                activebackground=self._THEME_LIGHT["btn_active"], activeforeground=self._web_fg,
+                bg=_t_plug["btn_bg"], fg=self._web_fg,
+                activebackground=_t_plug["btn_active"], activeforeground=self._web_fg,
                 relief=tk.FLAT, padx=8, pady=2, cursor="hand2",
             )
             copy_btn.pack(side=tk.LEFT)
@@ -1008,16 +1037,34 @@ class PackageViewerApp:
             bg=self._web_bg,
             fg=self._web_fg,
         )
-        self._theme_btn.place(relx=1, rely=0, x=-12, y=25, anchor=tk.NE)
+        self._theme_btn.place(relx=1, rely=0, x=-12, y=29, anchor=tk.NE)
         self._theme_btn.bind("<Button-1>", lambda e: self._toggle_theme())
         self._theme_btn.lift()
 
         self._apply_theme()  # 按当前时段（或默认）应用明/暗主题
+        self.root.after(150, self._apply_entry_colors)  # Windows 下延迟重设输入框配色，避免被系统覆盖
+
+    def _apply_entry_colors(self):
+        """单独重设所有输入框的配色，供首次显示或主题切换后修复 Windows 下的渲染问题"""
+        t = self._theme_colors()
+        cfg = dict(bg=t["entry_bg"], fg=self._web_fg, insertbackground=self._web_fg,
+                   selectbackground=self._web_select_bg, selectforeground=self._web_fg,
+                   highlightcolor=self._web_border, highlightbackground=self._web_border)
+        for name in ("_filter_entry", "_pub_entry"):
+            w = getattr(self, name, None)
+            if w and w.winfo_exists():
+                w.config(**cfg)
+        if getattr(self, "_limit_entry", None) and self._limit_entry.winfo_exists():
+            self._limit_entry.config(**cfg)
+        for e in getattr(self, "_plugin_entries", []):
+            if e and e.winfo_exists():
+                e.config(**dict(cfg, readonlybackground=t["entry_bg"]))
 
     def _on_notebook_tab_changed(self, event=None):
-        """切换到「获取包商店信息」页签时，焦点移到 notebook，避免限制数量输入框默认获焦"""
+        """切换到「获取包商店信息」或「插件」页签时，焦点移到 notebook，避免输入框默认获焦"""
         try:
-            if self._notebook.index(self._notebook.select()) == 1:
+            idx = self._notebook.index(self._notebook.select())
+            if idx in (1, 2):  # 1=获取包商店信息, 2=插件
                 self.root.after(0, self._notebook.focus_set)
         except (tk.TclError, ValueError):
             pass
@@ -1036,18 +1083,9 @@ class PackageViewerApp:
             self.root.after(80, self._set_filter_sash)
 
     def _update_back_to_doc_visibility(self):
-        """当 viewing package detail 且使用 HtmlFrame 时显示「返回文档」按钮"""
+        """链接已改为系统浏览器打开，不再显示「返回文档」按钮"""
         frame = getattr(self, "_back_to_doc_frame", None)
-        if not frame or not frame.winfo_exists():
-            return
-        if (
-            getattr(self, "_use_html", False)
-            and getattr(self, "_current_detail_type", None) == "package"
-            and getattr(self, "_current_detail_data", None)
-        ):
-            frame.place(relx=1, rely=0, x=-160, y=36, anchor=tk.NE)
-            frame.lift()
-        else:
+        if frame and frame.winfo_exists():
             frame.place_forget()
 
     def _back_to_document(self):
@@ -1148,6 +1186,8 @@ class PackageViewerApp:
         """切换浅色/深色主题"""
         self._dark_theme = not self._dark_theme
         self._apply_theme()
+        self.root.after(100, self._redraw_detail_html)  # 延迟重绘网页区，确保 ttk 样式更新完成后再刷新
+        self.root.after(150, self._apply_entry_colors)
 
     def _apply_theme(self):
         """应用当前主题到所有相关控件"""
@@ -1160,6 +1200,7 @@ class PackageViewerApp:
         self._web_border = t["border"]
         try:
             s = ttk.Style()
+            # 不在每次切换时 theme_use，避免 ttk 全局刷新导致 HtmlFrame 内容被重置
             s.configure("Web.TFrame", background=self._web_bg)
             s.configure("Web.TLabel", background=self._web_bg, foreground=self._web_fg, font=("Segoe UI", 9))
             s.configure("Web.TButton", background=t["btn_bg"], foreground=self._web_fg, padding=(10, 4))
@@ -1167,6 +1208,9 @@ class PackageViewerApp:
             s.configure("Web.TCheckbutton", background=self._web_bg, foreground=self._web_fg)
             s.configure("Web.Card.TLabel", background=self._web_card_bg, foreground=self._web_fg, font=("Segoe UI", 9))
             s.configure("Web.Card.TCheckbutton", background=self._web_card_bg, foreground=self._web_fg)
+            s.configure("Web.Detail.TFrame", background=self._web_card_bg)
+            sb_thumb, sb_trough = (t["btn_bg"], t["card"]) if self._dark_theme else ("#b0b0b0", "#e8e8e8")
+            s.configure("Vertical.TScrollbar", troughrelief="flat", background=sb_thumb, troughcolor=sb_trough)
         except Exception:
             pass
         for w in getattr(self, "_theme_frames_bg", []):
@@ -1196,13 +1240,14 @@ class PackageViewerApp:
             self._filter_type_inner.config(bg=self._web_card_bg)
         if getattr(self, "_filter_pub_lf", None) and self._filter_pub_lf.winfo_exists():
             self._filter_pub_lf.config(bg=self._web_card_bg)
+        _ent_cfg = dict(bg=t["entry_bg"], fg=self._web_fg, insertbackground=self._web_fg, selectbackground=self._web_select_bg, selectforeground=self._web_fg, highlightcolor=self._web_border, highlightbackground=self._web_border)
         for name in ("_filter_entry", "_pub_entry"):
             w = getattr(self, name, None)
             if w and w.winfo_exists():
-                w.config(bg=t["entry_bg"], fg=self._web_fg, insertbackground=self._web_fg, highlightcolor=self._web_border, highlightbackground=self._web_border)
+                w.config(**_ent_cfg)
         # 获取包商店信息页签：输入框、按钮、日志区随主题
         if getattr(self, "_limit_entry", None) and self._limit_entry.winfo_exists():
-            self._limit_entry.config(bg=t["entry_bg"], fg=self._web_fg, insertbackground=self._web_fg, highlightcolor=self._web_border, highlightbackground=self._web_border)
+            self._limit_entry.config(**_ent_cfg)
         if getattr(self, "fetch_btn", None) and self.fetch_btn.winfo_exists():
             self.fetch_btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
         if getattr(self, "_fetch_stop_btn", None) and self._fetch_stop_btn.winfo_exists():
@@ -1217,24 +1262,62 @@ class PackageViewerApp:
                         child.config(bg=self._web_card_bg)
         for e in getattr(self, "_plugin_entries", []):
             if e and e.winfo_exists():
-                e.config(bg=t["entry_bg"], fg=self._web_fg, insertbackground=self._web_fg, highlightcolor=self._web_border, highlightbackground=self._web_border)
+                cfg = dict(_ent_cfg, readonlybackground=t["entry_bg"])
+                e.config(**cfg)
         for btn in getattr(self, "_plugin_copy_btns", []):
             if btn and btn.winfo_exists():
                 btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
         for lbl in getattr(self, "_plugin_desc_labels", []):
             if lbl and lbl.winfo_exists():
                 lbl.config(foreground=self._web_fg_muted)
-        if not getattr(self, "_use_html", True) and getattr(self, "detail_widget", None) and self.detail_widget.winfo_exists():
-            self.detail_widget.config(bg=self._web_card_bg, fg=self._web_fg)
-        # 主题切换后按当前类型重绘详情区（包详情 / 摘要），使 HTML 随主题变色
+        if getattr(self, "detail_widget", None) and self.detail_widget.winfo_exists():
+            if getattr(self, "_use_html", True):
+                try:
+                    ttk.Style().configure("Web.Detail.TFrame", background=self._web_card_bg)
+                except Exception:
+                    pass
+            else:
+                self.detail_widget.config(bg=self._web_card_bg, fg=self._web_fg)
+        self._redraw_detail_html()
+
+    def _redraw_detail_html(self):
+        """按当前主题重绘详情区 HTML，供主题切换或筛选关闭时调用"""
+        if not getattr(self, "_use_html", True) or not getattr(self, "detail_widget", None) or not self.detail_widget.winfo_exists():
+            return
         dtype = getattr(self, "_current_detail_type", None)
         ddata = getattr(self, "_current_detail_data", None)
-        if dtype == "package" and isinstance(ddata, dict) and self._use_html:
-            self.detail_widget.load_html(format_info_html(ddata, dark=self._dark_theme))
-        elif dtype == "summary" and ddata and self._use_html:
-            body_bg = "#1a1a1a" if self._dark_theme else "#fff"
-            body_fg = "#ffffff" if self._dark_theme else "#212121"
-            html_msg = f'<html><body style="font-family:Segoe UI, sans-serif; background:{body_bg}; color:{body_fg}; padding:12px;"><p style="margin:0; font-weight:bold;">{html.escape(str(ddata))}</p></body></html>'
+        extra = getattr(self, "_current_detail_extra", "") or ""
+        dark = self._dark_theme
+        if dtype == "package" and isinstance(ddata, dict):
+            pkg_html = format_info_html(ddata, extra_notice=extra, dark=dark)
+            self.detail_widget.load_html(pkg_html)
+            self.root.update_idletasks()
+        elif dtype == "plain" and ddata:
+            if dark:
+                simple_style = """
+    html, body { font-family: Segoe UI, sans-serif; background: #1a1a1a; color: #ffffff; margin: 0; padding: 0; font-size: 14px; }
+    .wrap { background: #1a1a1a; color: #ffffff; padding: 12px; min-height: 100%; }
+    """
+                wrap, wrap_end = '<div class="wrap">', '</div>'
+            else:
+                simple_style = """
+    html, body { font-family: Segoe UI, sans-serif; background: #fff; color: #222; margin: 0; padding: 12px; font-size: 14px; }
+    """
+                wrap, wrap_end = "", ""
+            plain_html = f'<html><head><meta charset="utf-8"><style>{simple_style}</style></head><body>{wrap}<pre style="margin:0;white-space:pre-wrap;">{html.escape(str(ddata))}</pre>{wrap_end}</body></html>'
+            self.detail_widget.load_html(plain_html)
+        elif dtype == "summary" and ddata:
+            if dark:
+                summary_style = """
+    html, body { font-family: Segoe UI, sans-serif; background: #1a1a1a; color: #ffffff; margin: 0; padding: 0; font-size: 14px; }
+    .wrap { background: #1a1a1a; color: #ffffff; padding: 12px; min-height: 100%; }
+    """
+                html_msg = f'<html><head><meta charset="utf-8"><style>{summary_style}</style></head><body><div class="wrap"><p style="margin:0;font-weight:bold;">{html.escape(str(ddata))}</p></div></body></html>'
+            else:
+                summary_style = """
+    html, body { font-family: Segoe UI, sans-serif; background: #fff; color: #212121; margin: 0; padding: 12px; font-size: 14px; }
+    """
+                html_msg = f'<html><head><meta charset="utf-8"><style>{summary_style}</style></head><body><p style="margin:0;font-weight:bold;">{html.escape(str(ddata))}</p></body></html>'
             self.detail_widget.load_html(html_msg)
 
     def _build_filter_panel(self):
@@ -1253,9 +1336,12 @@ class PackageViewerApp:
         ttk.Label(search_row, text="搜索我的资源", style="Web.TLabel").pack(side=tk.LEFT, padx=(0, 6))
         self._filter_search_var = tk.StringVar()
         self._filter_search_var.trace_add("write", lambda *_: self._apply_filter_to_list())
+        t_f = self._theme_colors()
         self._filter_entry = tk.Entry(
             search_row, textvariable=self._filter_search_var, width=28,
-            bg=self._THEME_LIGHT["entry_bg"], fg=fg, insertbackground=fg, relief=tk.FLAT, highlightthickness=1,
+            bg=t_f["entry_bg"], fg=fg, insertbackground=fg,
+            selectbackground=self._web_select_bg, selectforeground=fg,
+            relief=tk.FLAT, highlightthickness=1,
             highlightcolor=border, highlightbackground=border, font=("Segoe UI", 10),
         )
         self._filter_entry.pack(side=tk.LEFT, padx=(0, 8), ipady=4, ipadx=6)
@@ -1390,7 +1476,9 @@ class PackageViewerApp:
         ttk.Label(pub_lf, text="搜索发行商", style="Web.Card.TLabel").pack(anchor=tk.W)
         self._pub_entry = tk.Entry(
             pub_lf, textvariable=self._filter_pub_search, width=26,
-            bg=self._THEME_LIGHT["entry_bg"], fg=fg, insertbackground=fg, relief=tk.FLAT, highlightthickness=1,
+            bg=t_f["entry_bg"], fg=fg, insertbackground=fg,
+            selectbackground=self._web_select_bg, selectforeground=fg,
+            relief=tk.FLAT, highlightthickness=1,
             highlightcolor=border, highlightbackground=border, font=("Segoe UI", 10),
         )
         self._pub_entry.pack(fill=tk.X, pady=(4, 8), ipady=4, ipadx=6)
@@ -1456,8 +1544,8 @@ class PackageViewerApp:
         """根据筛选条件过滤左侧列表。已实现：搜索我的资源、类型、发行商。"""
         self._filter_list()
 
-    def _set_detail_content(self, html_content: str = None, plain_text: str = None, _detail_type: str = None, _detail_data=None):
-        """设置右侧详情内容。有 html_content 时用网页；否则用纯文本。_detail_type/_detail_data 用于主题切换时重绘。"""
+    def _set_detail_content(self, html_content: str = None, plain_text: str = None, _detail_type: str = None, _detail_data=None, _detail_extra: str = ""):
+        """设置右侧详情内容。有 html_content 时用网页；否则用纯文本。_detail_type/_detail_data/_detail_extra 用于主题切换时重绘。"""
         frame = getattr(self, "_open_in_unity_frame", None)
         if frame and frame.winfo_exists():
             frame.place_forget()
@@ -1467,14 +1555,26 @@ class PackageViewerApp:
                 self.detail_widget.load_html(html_content)
                 self._current_detail_type = _detail_type or "html"
                 self._current_detail_data = _detail_data
+                self._current_detail_extra = _detail_extra or ""
                 self._current_summary_msg = None
             elif plain_text is not None:
-                body_bg = "#1a1a1a" if dark else "#fff"
-                body_fg = "#ffffff" if dark else "#222"
-                simple_html = f'<html><body style="font-family:Segoe UI; background:{body_bg}; color:{body_fg}; padding:12px;"><pre style="margin:0; white-space:pre-wrap;">{html.escape(plain_text)}</pre></body></html>'
+                if dark:
+                    simple_style = """
+    html, body { font-family: Segoe UI, sans-serif; background: #1a1a1a; color: #ffffff; margin: 0; padding: 0; font-size: 14px; }
+    .wrap { background: #1a1a1a; color: #ffffff; padding: 12px; min-height: 100%; }
+    """
+                    wrap = '<div class="wrap">'
+                    wrap_end = '</div>'
+                else:
+                    simple_style = """
+    html, body { font-family: Segoe UI, sans-serif; background: #fff; color: #222; margin: 0; padding: 12px; font-size: 14px; }
+    """
+                    wrap, wrap_end = "", ""
+                simple_html = f'<html><head><meta charset="utf-8"><style>{simple_style}</style></head><body>{wrap}<pre style="margin:0;white-space:pre-wrap;">{html.escape(plain_text)}</pre>{wrap_end}</body></html>'
                 self.detail_widget.load_html(simple_html)
                 self._current_detail_type = "plain"
-                self._current_detail_data = None
+                self._current_detail_data = plain_text  # 保存以便主题切换时重绘
+                self._current_detail_extra = ""
                 self._current_summary_msg = None
         else:
             self.detail_widget.config(state=tk.NORMAL)
@@ -1548,12 +1648,23 @@ class PackageViewerApp:
         self._current_summary_msg = msg
         self._current_detail_type = "summary"
         if self._use_html:
-            body_bg = "#1a1a1a" if self._dark_theme else "#fff"
-            body_fg = "#ffffff" if self._dark_theme else "#212121"
-            html_msg = (
-                f'<html><body style="font-family:Segoe UI, sans-serif; background:{body_bg}; color:{body_fg}; padding:12px;">'
-                f'<p style="margin:0; font-weight:bold;">{html.escape(msg)}</p></body></html>'
-            )
+            if self._dark_theme:
+                summary_style = """
+    html, body { font-family: Segoe UI, sans-serif; background: #1a1a1a; color: #ffffff; margin: 0; padding: 0; font-size: 14px; }
+    .wrap { background: #1a1a1a; color: #ffffff; padding: 12px; min-height: 100%; }
+    """
+                html_msg = (
+                    f'<html><head><meta charset="utf-8"><style>{summary_style}</style></head><body><div class="wrap">'
+                    f'<p style="margin:0;font-weight:bold;">{html.escape(msg)}</p></div></body></html>'
+                )
+            else:
+                summary_style = """
+    html, body { font-family: Segoe UI, sans-serif; background: #fff; color: #212121; margin: 0; padding: 12px; font-size: 14px; }
+    """
+                html_msg = (
+                    f'<html><head><meta charset="utf-8"><style>{summary_style}</style></head><body>'
+                    f'<p style="margin:0;font-weight:bold;">{html.escape(msg)}</p></body></html>'
+                )
             self._set_detail_content(html_content=html_msg, _detail_type="summary", _detail_data=msg)
         else:
             self._set_detail_content(plain_text=msg)
@@ -1684,7 +1795,7 @@ class PackageViewerApp:
                 try:
                     data = json.loads(info_path.read_text(encoding="utf-8"))
                     if self._use_html:
-                        self._set_detail_content(html_content=format_info_html(data, extra_notice="※ 未下载：下载目录中无此文件。", dark=self._dark_theme))
+                        self._set_detail_content(html_content=format_info_html(data, extra_notice="※ 未下载：下载目录中无此文件。", dark=self._dark_theme), _detail_type="package", _detail_data=data, _detail_extra="※ 未下载：下载目录中无此文件。")
                     else:
                         self._set_detail_content(plain_text=f"※ 未下载：下载目录中无此文件。\n\n{format_info(data)}")
                 except Exception:
