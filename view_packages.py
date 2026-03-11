@@ -925,13 +925,14 @@ class PackageViewerApp:
         self._theme_frames_bg.append(self._tab3_container)
 
         plugins_hint, plugins_data = _load_plugins()
+        empty_hint = "插件列表为空。请到项目 GitHub 仓库下载 plugin.json 文件，并与 exe 放在同一目录。"
         tab3_hint = tk.Frame(self._tab3_container, bg=self._web_bg)
         tab3_hint.pack(fill=tk.X, pady=(0, 12))
         self._theme_frames_bg.append(tab3_hint)
         ttk.Label(
             tab3_hint,
             style="Web.TLabel",
-            text=plugins_hint,
+            text=empty_hint if not plugins_data else plugins_hint,
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, anchor=tk.W)
 
         tab3_canvas = tk.Canvas(self._tab3_container, highlightthickness=0, bg=self._web_bg)
