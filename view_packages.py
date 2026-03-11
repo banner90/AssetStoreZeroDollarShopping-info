@@ -20,6 +20,13 @@ try:
 except ImportError:
     HAS_HTML_FRAME = False
 
+try:
+    from PIL import Image
+    import pilmoji.source  # noqa: F401
+    HAS_PILMOJI = True
+except ImportError:
+    HAS_PILMOJI = False
+
 # 支持 PyInstaller 打包后路径
 if getattr(sys, "frozen", False):
     _BASE = Path(sys.executable).resolve().parent
@@ -133,7 +140,7 @@ def html_to_safe_html(html_text: str, base_url: str = "https://assetstore.unity.
     """
     if not html_text:
         return ""
-    text = html.unescape(html_text)
+    text = html_text
     text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.I | re.DOTALL)
     text = re.sub(r"<iframe[^>]*>.*?</iframe>", "", text, flags=re.I | re.DOTALL)
     text = re.sub(r"<object[^>]*>.*?</object>", "", text, flags=re.I | re.DOTALL)
@@ -175,6 +182,165 @@ def html_to_safe_html(html_text: str, base_url: str = "https://assetstore.unity.
 def _escape_html(text: str) -> str:
     """转义 HTML 特殊字符"""
     return html.escape(str(text or ""), quote=False)
+
+
+_EMOJI_IMG_CACHE = {}  # 缓存 emoji -> base64 data URL，避免重复渲染
+_EMOJI_FAIL_CACHE = set()  # 已确认无法获取的 emoji，避免重复尝试
+
+
+def _get_platform_default_emoji_style() -> str:
+    """默认用 twemoji，CDN 稳定且无需多次重试"""
+    return "twemoji"
+
+
+def _get_pilmoji_source(style: str | None = None):
+    """按 style 返回 pilmoji 源。可选: google, twemoji, apple, microsoft"""
+    if style is None:
+        raw = load_config().get("emoji_style")
+        style = (raw or _get_platform_default_emoji_style()).strip().lower()
+    try:
+        if style == "google":
+            from pilmoji.source import GoogleEmojiSource
+            return GoogleEmojiSource()
+        if style == "apple":
+            from pilmoji.source import AppleEmojiSource
+            return AppleEmojiSource()
+        if style == "microsoft":
+            from pilmoji.source import MicrosoftEmojiSource
+            return MicrosoftEmojiSource()
+        if style in ("twemoji", "twitter"):
+            from pilmoji.source import Twemoji
+            return Twemoji()
+    except ImportError:
+        pass
+    return None
+
+
+def _get_effective_emoji_style() -> str:
+    """返回当前生效的 emoji_style（含平台默认）"""
+    raw = load_config().get("emoji_style")
+    return (raw or _get_platform_default_emoji_style()).strip().lower()
+
+
+def _render_emoji_to_data_url(emoji_char: str, size: int = 18) -> str | None:
+    """从 CDN 源获取 emoji 图片并缩放为 PNG data URL，失败返回 None"""
+    if not HAS_PILMOJI or not emoji_char:
+        return None
+    primary = _get_effective_emoji_style()
+    cache_key = f"{primary}:{emoji_char}"
+    if cache_key in _EMOJI_IMG_CACHE:
+        return _EMOJI_IMG_CACHE[cache_key]
+    if cache_key in _EMOJI_FAIL_CACHE:
+        return None
+    import base64
+    import io
+    source = _get_pilmoji_source(primary)
+    if source is None:
+        from pilmoji.source import Twemoji
+        source = Twemoji()
+    try:
+        stream = source.get_emoji(emoji_char)
+        if stream:
+            orig = Image.open(stream).convert("RGBA")
+            resized = orig.resize((size, size), Image.LANCZOS)
+            buf = io.BytesIO()
+            resized.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            url = f"data:image/png;base64,{b64}"
+            _EMOJI_IMG_CACHE[cache_key] = url
+            return url
+    except Exception:
+        pass
+    _EMOJI_FAIL_CACHE.add(cache_key)
+    return None
+
+
+def _collect_emoji_chars(s: str) -> list[str]:
+    """从 HTML 中提取所有需要渲染的 emoji 字符（已去重）"""
+    if not s:
+        return []
+    chars = set()
+    for m in re.finditer(r"&#(x[0-9a-fA-F]+|\d+);", s):
+        g = m.group(1)
+        code = int(g[1:], 16) if g.startswith("x") else int(g, 10)
+        if code >= 0x10000 and code <= 0x10FFFF:
+            chars.add(chr(code))
+        elif code in (0x2705, 0x274C, 0x274E, 0x2B50, 0x2B55):
+            chars.add(chr(code))
+    for m in re.finditer(r"[\U00010000-\U0010FFFF]", s):
+        chars.add(m.group(0))
+    for c in "\u2705\u274c\u274e\u2b50\u2b55":
+        if c in s:
+            chars.add(c)
+    return list(chars)
+
+
+def _prefetch_emoji_batch(chars: list[str], callback=None):
+    """在后台线程批量预取 emoji 图片到缓存，完成后调用 callback（在主线程外）"""
+    if not HAS_PILMOJI or not chars:
+        if callback:
+            callback()
+        return
+    primary = _get_effective_emoji_style()
+    uncached = [c for c in chars if f"{primary}:{c}" not in _EMOJI_IMG_CACHE and f"{primary}:{c}" not in _EMOJI_FAIL_CACHE]
+    if not uncached:
+        if callback:
+            callback()
+        return
+
+    def _worker():
+        for char in uncached:
+            _render_emoji_to_data_url(char)
+        if callback:
+            callback()
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+
+def _replace_emoji_for_tkhtml(s: str, fallback: str = "\u2022", use_pilmoji: bool = False) -> str:
+    """
+    Tkhtml/Tcl-Tk 无法正确渲染 emoji。默认用文本等效符号（✓• 等）；use_pilmoji=True 时尝试转为图片（可能显示异常）。
+    """
+    if not s:
+        return s
+
+    _bmp_emoji_map = {
+        "\u2705": "\u2713", "\u274c": "\u2717", "\u274e": "\u2717",
+        "\u2b50": "*", "\u2b55": "\u2022",
+    }
+    _img_tpl = '<img src="{}" alt="" style="vertical-align:-4px;width:18px;height:18px;display:inline-block;margin:0 1px">'
+
+    def _to_img(char: str):
+        url = _render_emoji_to_data_url(char) if (use_pilmoji and HAS_PILMOJI) else None
+        return _img_tpl.format(url) if url else None
+
+    def replace_entity(match):
+        g = match.group(1)
+        code = int(g[1:], 16) if g.startswith("x") else int(g, 10)
+        if code > 0x10FFFF:
+            return match.group(0)
+        char = chr(code)
+        if code >= 0x10000:
+            return _to_img(char) or fallback
+        if code in (0x2705, 0x274C, 0x274E, 0x2B50, 0x2B55):
+            return _to_img(char) or _bmp_emoji_map.get(char, fallback)
+        return match.group(0)
+
+    s = re.sub(r"&#(x[0-9a-fA-F]+|\d+);", replace_entity, s)
+    s = re.sub(r"\ufe0f", "", s)
+
+    def replace_supp(match):
+        c = match.group(0)
+        return _to_img(c) or fallback
+
+    s = re.sub(r"[\U00010000-\U0010FFFF]", replace_supp, s)
+
+    for emoji_char, repl in _bmp_emoji_map.items():
+        if emoji_char in s:
+            base = emoji_char.replace("\ufe0f", "")
+            s = s.replace(emoji_char, _to_img(base) or repl)
+    return s
 
 
 def _format_date_official(iso_date: str) -> str:
@@ -248,34 +414,35 @@ def _build_srp_compat_table(detail: dict) -> str:
     return header + body + "</tbody></table></div>"
 
 
-def format_info_html(data: dict, extra_notice: str = "", dark: bool = False) -> str:
-    """生成 Unity Asset Store 风格的 HTML；dark=True 时使用深色背景与白色文字"""
+def format_info_html(data: dict, extra_notice: str = "", dark: bool = False, use_pilmoji: bool = None) -> str:
+    """生成 Unity Asset Store 风格的 HTML；dark=True 时使用深色背景；use_pilmoji=True 时用 pilmoji 渲染 emoji 为图片（可在 asset_store_config.json 中配置 use_emoji_images）"""
     pid = data.get("packageId")
     display_name = data.get("displayName", "")
     detail = data.get("detail")
 
+    _emoji_fonts = '"Segoe UI Emoji", "Segoe UI Symbol", "Apple Color Emoji", "Noto Color Emoji"'
     if dark:
-        style = """
-    body { font-family: Inter, "Noto Sans SC", Roboto, "Segoe UI", sans-serif; background: #1a1a1a; color: #ffffff; margin: 12px 16px; font-size: 16px; line-height: 1.5; }
-    .title { font-size: 1.125rem; font-weight: 600; color: #ffffff; margin-bottom: 16px; }
-    .meta { color: #ffffff; margin-bottom: 16px; }
-    .meta-row { margin: 4px 0; }
-    .meta-label { color: #b0b0b0; font-size: 0.875rem; }
-    .section { margin-top: 20px; padding-top: 16px; border-top: 1px solid #444; }
-    .section-title { font-size: 0.875rem; font-weight: 600; color: #ffffff; margin-bottom: 8px; }
-    .desc, .notes { color: #ffffff; white-space: pre-wrap; word-wrap: break-word; }
-    .notice { background: #3d3d00; color: #e0e0a0; padding: 8px 12px; border-radius: 4px; margin-bottom: 12px; }
-    .uploads { margin: 4px 0; }
-    .uploads-item { padding: 2px 0; color: #ffffff; }
-    .technical-details table, .rpc table { border-collapse: collapse; margin: 8px 0; }
-    .technical-details td, .rpc td { border: 1px solid #444; padding: 4px 8px; }
-    a { color: #7eb8ff; text-decoration: none; }
-    a:hover { color: #9ec8ff; text-decoration: underline; }
+        style = f"""
+    body {{ font-family: Inter, "Noto Sans SC", Roboto, "Segoe UI", {_emoji_fonts}, sans-serif; background: #1a1a1a; color: #ffffff; margin: 12px 16px; font-size: 16px; line-height: 1.5; }}
+    .title {{ font-size: 1.125rem; font-weight: 600; color: #ffffff; margin-bottom: 16px; }}
+    .meta {{ color: #ffffff; margin-bottom: 16px; }}
+    .meta-row {{ margin: 4px 0; }}
+    .meta-label {{ color: #b0b0b0; font-size: 0.875rem; }}
+    .section {{ margin-top: 20px; padding-top: 16px; border-top: 1px solid #444; }}
+    .section-title {{ font-size: 0.875rem; font-weight: 600; color: #ffffff; margin-bottom: 8px; }}
+    .desc, .notes {{ color: #ffffff; white-space: pre-wrap; word-wrap: break-word; }}
+    .notice {{ background: #3d3d00; color: #e0e0a0; padding: 8px 12px; border-radius: 4px; margin-bottom: 12px; }}
+    .uploads {{ margin: 4px 0; }}
+    .uploads-item {{ padding: 2px 0; color: #ffffff; }}
+    .technical-details table, .rpc table {{ border-collapse: collapse; margin: 8px 0; }}
+    .technical-details td, .rpc td {{ border: 1px solid #444; padding: 4px 8px; }}
+    a {{ color: #7eb8ff; text-decoration: none; }}
+    a:hover {{ color: #9ec8ff; text-decoration: underline; }}
     """
     else:
         style = """
     body {
-        font-family: Inter, "Noto Sans SC", "Noto Sans JP", "Noto Sans KR", Roboto, -apple-system, BlinkMacSystemFont, "Segoe UI", Oxygen, Ubuntu, Cantarell, "Fira Sans", "Droid Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+        font-family: Inter, "Noto Sans SC", "Noto Sans JP", "Noto Sans KR", Roboto, -apple-system, BlinkMacSystemFont, "Segoe UI", """ + _emoji_fonts + """, Oxygen, Ubuntu, Cantarell, "Fira Sans", "Droid Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
         background: #fff;
         color: #212121;
         margin: 12px 16px;
@@ -454,7 +621,10 @@ def format_info_html(data: dict, extra_notice: str = "", dark: bool = False) -> 
     if rpc and rpc is not tech:
         parts.append('<div class="section"><div class="section-title">渲染管线兼容性</div><div class="rpc">')
         if isinstance(rpc, str):
-            parts.append(rpc if rpc.strip().startswith("<") else _escape_html(rpc).replace("\n", "<br>"))
+            if rpc.strip().startswith("<"):
+                parts.append(rpc)
+            else:
+                parts.append(_escape_html(rpc).replace("\n", "<br>"))
         elif isinstance(rpc, (dict, list)):
             parts.append(_escape_html(str(rpc)).replace("\n", "<br>"))
         else:
@@ -469,7 +639,10 @@ def format_info_html(data: dict, extra_notice: str = "", dark: bool = False) -> 
         parts.append("</div></div>")
 
     parts.append("</body></html>")
-    return "".join(parts)
+    html_result = "".join(parts)
+    if use_pilmoji is None:
+        use_pilmoji = load_config().get("use_emoji_images", True)  # 默认启用 pilmoji 图片，设为 false 则用 • 等文本
+    return _replace_emoji_for_tkhtml(html_result, use_pilmoji=use_pilmoji)
 
 
 def format_info(data: dict) -> str:
@@ -662,7 +835,7 @@ class PackageViewerApp:
         self._main_paned = paned
 
         left_container = tk.Frame(paned, bg=self._web_bg)
-        paned.add(left_container, weight=3)
+        paned.add(left_container, weight=1)
         left_frame = tk.Frame(left_container, bg=self._web_bg, padx=8, pady=8)
         left_frame.pack(fill=tk.BOTH, expand=True)
         search_row = tk.Frame(left_frame, bg=self._web_bg)
@@ -735,7 +908,7 @@ class PackageViewerApp:
         self._theme_frames_bg.extend([left_container, left_frame, search_row, btn_row])
 
         right_frame = tk.Frame(paned, bg=self._web_bg, padx=8, pady=4)
-        paned.add(right_frame, weight=1)
+        paned.add(right_frame, weight=2)
         self._right_show_filter = False
 
         # 右侧：详情 与 筛选 两个视图，同一时间只显示一个
@@ -760,7 +933,7 @@ class PackageViewerApp:
             self.detail_widget = HtmlFrame(
                 self.detail_container,
                 messages_enabled=False,
-                selection_enabled=False,  # 避免 Python 3.14 与 tkinterweb 选择管理器的 str/int 比较崩溃
+                selection_enabled=True,
                 on_link_click=lambda url: webbrowser.open(url),
                 style="Web.Detail.TFrame",
             )
@@ -894,8 +1067,48 @@ class PackageViewerApp:
         )
         self._fetch_stop_btn.pack(side=tk.LEFT, padx=4)
         self._fetch_stop_requested = False
+        tk.Frame(fetch_row, bg=self._web_bg, width=12).pack(side=tk.LEFT)
         self.fetch_status = ttk.Label(fetch_row, text="", style="Web.TLabel")
-        self.fetch_status.pack(side=tk.LEFT, padx=8)
+        self.fetch_status.pack(side=tk.LEFT, padx=(0, 4))
+        _spacer = tk.Frame(fetch_row, bg=self._web_bg, width=24)
+        _spacer.pack(side=tk.LEFT)
+        self._theme_frames_bg.append(_spacer)
+        ttk.Label(fetch_row, text="单独拉取 ID:", style="Web.TLabel").pack(side=tk.LEFT, padx=(0, 4))
+        self._single_fetch_var = tk.StringVar(value="")
+        self._single_fetch_entry = tk.Entry(
+            fetch_row,
+            textvariable=self._single_fetch_var,
+            width=8,
+            font=("Segoe UI", 10),
+            bg=_t2["entry_bg"],
+            fg=self._web_fg,
+            insertbackground=self._web_fg,
+            selectbackground=self._web_select_bg,
+            selectforeground=self._web_fg,
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightcolor=self._web_border,
+            highlightbackground=self._web_border,
+        )
+        self._single_fetch_entry.pack(side=tk.LEFT, padx=2, ipady=2, ipadx=4)
+        self._single_fetch_btn = tk.Button(
+            fetch_row,
+            text="拉取",
+            command=self._start_single_fetch,
+            font=("Segoe UI", 10),
+            bg=self._THEME_LIGHT["btn_bg"],
+            fg=self._web_fg,
+            activebackground=self._THEME_LIGHT["btn_active"],
+            activeforeground=self._web_fg,
+            relief=tk.FLAT,
+            padx=8,
+            pady=4,
+            cursor="hand2",
+        )
+        self._single_fetch_btn.pack(side=tk.LEFT, padx=2)
+        tk.Frame(fetch_row, bg=self._web_bg, width=8).pack(side=tk.LEFT)
+        self._single_fetch_status = ttk.Label(fetch_row, text="", style="Web.TLabel")
+        self._single_fetch_status.pack(side=tk.LEFT, padx=(0, 4))
 
         # 日志区：Text + ttk 扁平滚动条（与包列表一致）
         fetch_log_frame = tk.Frame(self._tab2_container, bg=self._web_bg)
@@ -1057,6 +1270,8 @@ class PackageViewerApp:
                 w.config(**cfg)
         if getattr(self, "_limit_entry", None) and self._limit_entry.winfo_exists():
             self._limit_entry.config(**cfg)
+        if getattr(self, "_single_fetch_entry", None) and self._single_fetch_entry.winfo_exists():
+            self._single_fetch_entry.config(**cfg)
         for e in getattr(self, "_plugin_entries", []):
             if e and e.winfo_exists():
                 e.config(**dict(cfg, readonlybackground=t["entry_bg"]))
@@ -1093,7 +1308,8 @@ class PackageViewerApp:
         """返回包详情文档页"""
         ddata = getattr(self, "_current_detail_data", None)
         if ddata and getattr(self, "_use_html", False):
-            self.detail_widget.load_html(format_info_html(ddata, dark=self._dark_theme))
+            extra = getattr(self, "_current_detail_extra", "") or ""
+            self._show_html_with_async_emoji(ddata, extra_notice=extra, dark=self._dark_theme)
 
     def _update_open_in_unity_visibility(self):
         """仅当有选中且选中项为已下载资源时显示「在Unity中打开」按钮"""
@@ -1155,7 +1371,7 @@ class PackageViewerApp:
         self.filter_btn.config(text="筛选")
 
     def _set_main_sash_once(self):
-        """窗口显示后按当前宽度把资源列表设为约 35%，只执行一次"""
+        """窗口显示后把资源列表设为约 35%，窗口未就绪时自动重试"""
         if getattr(self, "_main_sash_set", True):
             return
         try:
@@ -1164,9 +1380,10 @@ class PackageViewerApp:
                 return
             w = pw.winfo_width()
             if w > 200:
-                pos = int(w * 0.35)
-                pw.sashpos(0, pos)
+                pw.sashpos(0, int(w * 0.35))
                 self._main_sash_set = True
+            else:
+                self.root.after(200, self._set_main_sash_once)
         except Exception:
             pass
 
@@ -1238,7 +1455,7 @@ class PackageViewerApp:
             if w and w.winfo_exists():
                 w.config(bg=self._web_bg)
         if getattr(self, "_filter_type_inner", None) and self._filter_type_inner.winfo_exists():
-            self._filter_type_inner.config(bg=self._web_card_bg)
+            self._update_type_tree_theme(self._filter_type_inner)
         if getattr(self, "_filter_pub_lf", None) and self._filter_pub_lf.winfo_exists():
             self._filter_pub_lf.config(bg=self._web_card_bg)
         _ent_cfg = dict(bg=t["entry_bg"], fg=self._web_fg, insertbackground=self._web_fg, selectbackground=self._web_select_bg, selectforeground=self._web_fg, highlightcolor=self._web_border, highlightbackground=self._web_border)
@@ -1249,6 +1466,10 @@ class PackageViewerApp:
         # 获取包商店信息页签：输入框、按钮、日志区随主题
         if getattr(self, "_limit_entry", None) and self._limit_entry.winfo_exists():
             self._limit_entry.config(**_ent_cfg)
+        if getattr(self, "_single_fetch_entry", None) and self._single_fetch_entry.winfo_exists():
+            self._single_fetch_entry.config(**_ent_cfg)
+        if getattr(self, "_single_fetch_btn", None) and self._single_fetch_btn.winfo_exists():
+            self._single_fetch_btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
         if getattr(self, "fetch_btn", None) and self.fetch_btn.winfo_exists():
             self.fetch_btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
         if getattr(self, "_fetch_stop_btn", None) and self._fetch_stop_btn.winfo_exists():
@@ -1290,9 +1511,7 @@ class PackageViewerApp:
         extra = getattr(self, "_current_detail_extra", "") or ""
         dark = self._dark_theme
         if dtype == "package" and isinstance(ddata, dict):
-            pkg_html = format_info_html(ddata, extra_notice=extra, dark=dark)
-            self.detail_widget.load_html(pkg_html)
-            self.root.update_idletasks()
+            self._show_html_with_async_emoji(ddata, extra_notice=extra, dark=dark)
         elif dtype == "plain" and ddata:
             if dark:
                 simple_style = """
@@ -1419,17 +1638,11 @@ class PackageViewerApp:
         type_canvas.bind("<MouseWheel>", _type_wheel)
 
         self._filter_type_vars = {}
+        self._filter_type_group_frames = {}
         type_counts = self._collect_category_counts()
-        for cat_name, count in sorted(type_counts.items(), key=lambda x: -x[1]):
-            self._filter_type_vars[cat_name] = tk.BooleanVar(value=False)
-            ttk.Checkbutton(
-                type_inner,
-                text=f"{cat_name} ({count})",
-                variable=self._filter_type_vars[cat_name],
-                command=self._apply_filter_to_list,
-                style="Web.Card.TCheckbutton",
-            ).pack(anchor=tk.W)
-        if not type_counts:
+        if type_counts:
+            self._build_type_tree(type_inner, type_counts)
+        else:
             ttk.Label(type_inner, text="(暂无类型数据，请先获取包商店信息)", style="Web.Card.TLabel", foreground=self._web_fg_muted).pack(anchor=tk.W)
 
         # 右列：发行商（独立滚动，weight 更大让发行商区域露出更多）
@@ -1514,6 +1727,111 @@ class PackageViewerApp:
                 pass
         return counts
 
+    def _build_type_tree(self, parent, type_counts: dict):
+        """将扁平的分类计数构建为可折叠的树形 UI（仿 Unity Asset Store 官网筛选样式）"""
+        bg = parent.cget("bg")
+        fg = self._web_fg
+        fg_count = self._web_fg_muted
+        tree = {}
+        for full_name, count in type_counts.items():
+            parts = full_name.split("/")
+            top = parts[0]
+            if top not in tree:
+                tree[top] = {"_total": 0, "_self": 0, "_children": {}}
+            tree[top]["_total"] += count
+            if len(parts) == 1:
+                tree[top]["_self"] = count
+            else:
+                tree[top]["_children"][full_name] = count
+
+        for top_name in sorted(tree.keys(), key=lambda k: -tree[k]["_total"]):
+            node = tree[top_name]
+            children = node["_children"]
+
+            if not children:
+                cnt = node["_self"]
+                self._filter_type_vars[top_name] = tk.BooleanVar(value=False)
+                row = tk.Frame(parent, bg=bg)
+                row.pack(anchor=tk.W, fill=tk.X, pady=1)
+                ttk.Checkbutton(
+                    row, text=f"{top_name}",
+                    variable=self._filter_type_vars[top_name],
+                    command=self._apply_filter_to_list,
+                    style="Web.Card.TCheckbutton",
+                ).pack(side=tk.LEFT)
+                tk.Label(row, text=f"({cnt})", font=("Segoe UI", 9),
+                         bg=bg, fg=fg_count).pack(side=tk.LEFT, padx=(2, 0))
+                continue
+
+            header = tk.Frame(parent, bg=bg)
+            header.pack(anchor=tk.W, fill=tk.X, pady=(6, 1))
+            expanded = tk.BooleanVar(value=False)
+
+            self._filter_type_vars[top_name] = tk.BooleanVar(value=False)
+            cb = ttk.Checkbutton(
+                header, text=f"{top_name}",
+                variable=self._filter_type_vars[top_name],
+                command=self._apply_filter_to_list,
+                style="Web.Card.TCheckbutton",
+            )
+            cb.pack(side=tk.LEFT)
+            tk.Label(header, text=f"({node['_total']})", font=("Segoe UI", 9),
+                     bg=bg, fg=fg_count).pack(side=tk.LEFT, padx=(2, 0))
+
+            arrow_lbl = tk.Label(header, text="∨", font=("Segoe UI", 10),
+                                 bg=bg, fg=fg_count, cursor="hand2")
+            arrow_lbl.pack(side=tk.RIGHT, padx=(0, 4))
+
+            child_frame = tk.Frame(parent, bg=bg)
+            self._filter_type_group_frames[top_name] = (arrow_lbl, child_frame, expanded)
+
+            top_depth = top_name.count("/") + 1
+            for full_name in sorted(children.keys()):
+                cnt = children[full_name]
+                display = full_name.split("/")[-1]
+                depth = full_name.count("/") - top_depth + 1
+                indent = max(depth, 1) * 20
+                self._filter_type_vars[full_name] = tk.BooleanVar(value=False)
+                row = tk.Frame(child_frame, bg=bg)
+                row.pack(anchor=tk.W, fill=tk.X, pady=1)
+                tk.Frame(row, width=indent, bg=bg).pack(side=tk.LEFT)
+                ttk.Checkbutton(
+                    row, text=f"{display}",
+                    variable=self._filter_type_vars[full_name],
+                    command=self._apply_filter_to_list,
+                    style="Web.Card.TCheckbutton",
+                ).pack(side=tk.LEFT)
+                tk.Label(row, text=f"({cnt})", font=("Segoe UI", 9),
+                         bg=bg, fg=fg_count).pack(side=tk.LEFT, padx=(2, 0))
+
+            def _toggle(arrow=arrow_lbl, frame=child_frame, var=expanded, after_w=header):
+                if var.get():
+                    frame.pack_forget()
+                    arrow.config(text="∨")
+                    var.set(False)
+                else:
+                    frame.pack(anchor=tk.W, fill=tk.X, after=after_w)
+                    arrow.config(text="∧")
+                    var.set(True)
+
+            arrow_lbl.bind("<Button-1>", lambda e, t=_toggle: t())
+
+    def _update_type_tree_theme(self, container):
+        """递归更新类型筛选树的所有控件配色"""
+        card = self._web_card_bg
+        fg_m = self._web_fg_muted
+        container.config(bg=card)
+        for w in container.winfo_children():
+            if not w.winfo_exists():
+                continue
+            if isinstance(w, tk.Frame):
+                w.config(bg=card)
+                self._update_type_tree_theme(w)
+            elif isinstance(w, tk.Label):
+                is_count = "(" in (w.cget("text") or "")
+                is_arrow = w.cget("text") in ("∨", "∧")
+                w.config(bg=card, fg=fg_m if (is_count or is_arrow) else self._web_fg)
+
     def _collect_publisher_counts(self):
         """从 metadata 目录下的 json 汇总发行商及数量"""
         counts = {}
@@ -1547,9 +1865,6 @@ class PackageViewerApp:
 
     def _set_detail_content(self, html_content: str = None, plain_text: str = None, _detail_type: str = None, _detail_data=None, _detail_extra: str = ""):
         """设置右侧详情内容。有 html_content 时用网页；否则用纯文本。_detail_type/_detail_data/_detail_extra 用于主题切换时重绘。"""
-        frame = getattr(self, "_open_in_unity_frame", None)
-        if frame and frame.winfo_exists():
-            frame.place_forget()
         dark = self._dark_theme
         if self._use_html:
             if html_content is not None:
@@ -1574,7 +1889,7 @@ class PackageViewerApp:
                 simple_html = f'<html><head><meta charset="utf-8"><style>{simple_style}</style></head><body>{wrap}<pre style="margin:0;white-space:pre-wrap;">{html.escape(plain_text)}</pre>{wrap_end}</body></html>'
                 self.detail_widget.load_html(simple_html)
                 self._current_detail_type = "plain"
-                self._current_detail_data = plain_text  # 保存以便主题切换时重绘
+                self._current_detail_data = plain_text
                 self._current_detail_extra = ""
                 self._current_summary_msg = None
         else:
@@ -1587,7 +1902,7 @@ class PackageViewerApp:
             self._current_detail_type = _detail_type or "plain"
             self._current_detail_data = _detail_data
             self._current_summary_msg = None
-        self.root.after(800, self._update_open_in_unity_visibility)
+        self._update_open_in_unity_visibility()
 
     def _toggle_sort(self):
         self.sort_by_snapshot = not self.sort_by_snapshot
@@ -1714,7 +2029,14 @@ class PackageViewerApp:
                     return cat.get("name") if isinstance(cat, dict) else None
                 except Exception:
                     return None
-            items = [(t, d) for t, d in items if _category_for_item(t, d) in selected_types]
+            def _match_category(cat_name):
+                if not cat_name:
+                    return False
+                for st in selected_types:
+                    if cat_name == st or cat_name.startswith(st + "/"):
+                        return True
+                return False
+            items = [(t, d) for t, d in items if _match_category(_category_for_item(t, d))]
 
         # 发行商筛选：若勾选了发行商，只保留 metadata 中发行商在勾选范围内的项
         selected_pubs = []
@@ -1796,7 +2118,7 @@ class PackageViewerApp:
                 try:
                     data = json.loads(info_path.read_text(encoding="utf-8"))
                     if self._use_html:
-                        self._set_detail_content(html_content=format_info_html(data, extra_notice="※ 未下载：下载目录中无此文件。", dark=self._dark_theme), _detail_type="package", _detail_data=data, _detail_extra="※ 未下载：下载目录中无此文件。")
+                        self._show_html_with_async_emoji(data, extra_notice="※ 未下载：下载目录中无此文件。", dark=self._dark_theme)
                     else:
                         self._set_detail_content(plain_text=f"※ 未下载：下载目录中无此文件。\n\n{format_info(data)}")
                 except Exception:
@@ -1814,13 +2136,69 @@ class PackageViewerApp:
         try:
             data = json.loads(info_path.read_text(encoding="utf-8"))
             if self._use_html:
-                self._set_detail_content(html_content=format_info_html(data, dark=self._dark_theme), _detail_type="package", _detail_data=data)
+                self._show_html_with_async_emoji(data, dark=self._dark_theme)
             else:
                 self._set_detail_content(plain_text=format_info(data))
             self._update_open_in_unity_visibility()
         except Exception as e:
             self._set_detail_content(plain_text=f"读取失败: {e}")
             self._update_open_in_unity_visibility()
+
+    def _show_html_with_async_emoji(self, data: dict, extra_notice: str = "", dark: bool = False):
+        """两阶段渲染：立即用文本替代显示，后台获取 emoji 图片后自动刷新"""
+        html_fast = format_info_html(data, extra_notice=extra_notice, dark=dark, use_pilmoji=False)
+        self._set_detail_content(
+            html_content=html_fast, _detail_type="package",
+            _detail_data=data, _detail_extra=extra_notice,
+        )
+        detail = data.get("detail") or {}
+        raw_parts = []
+        for key in ("description", "elevatorPitch", "keyFeatures", "publishNotes"):
+            v = detail.get(key)
+            if v and isinstance(v, str):
+                raw_parts.append(v)
+        loc = detail.get("localizations")
+        if isinstance(loc, dict):
+            zh = loc.get("zh-CN")
+            if isinstance(zh, dict):
+                for key in ("description", "keyFeatures", "publishNotes"):
+                    v = zh.get(key)
+                    if v and isinstance(v, str):
+                        raw_parts.append(v)
+        all_text = " ".join(raw_parts)
+        chars = _collect_emoji_chars(all_text)
+        if not chars:
+            return
+        pid = data.get("packageId", "")
+
+        def _on_done():
+            try:
+                self.root.after(0, self._refresh_emoji_if_same, pid, data, extra_notice)
+            except Exception:
+                pass
+
+        _prefetch_emoji_batch(chars, callback=_on_done)
+
+    def _refresh_emoji_if_same(self, pid, data, extra_notice):
+        """后台 emoji 加载完毕后，如果当前仍显示同一个包，则用真实 emoji 刷新并保持滚动位置"""
+        cur = getattr(self, "_current_detail_data", None)
+        if not isinstance(cur, dict) or cur.get("packageId") != pid:
+            return
+        scroll_pos = 0.0
+        try:
+            scroll_pos = self.detail_widget.html.yview()[0]
+        except Exception:
+            pass
+        html_full = format_info_html(data, extra_notice=extra_notice, dark=self._dark_theme, use_pilmoji=True)
+        self._set_detail_content(
+            html_content=html_full, _detail_type="package",
+            _detail_data=data, _detail_extra=extra_notice,
+        )
+        if scroll_pos > 0.001:
+            try:
+                self.root.after(50, lambda: self.detail_widget.html.yview_moveto(scroll_pos))
+            except Exception:
+                pass
 
     def _log(self, msg: str):
         self.fetch_log.insert(tk.END, msg + "\n")
@@ -1829,6 +2207,69 @@ class PackageViewerApp:
 
     def _stop_fetch(self):
         self._fetch_stop_requested = True
+
+    def _start_single_fetch(self):
+        pid_str = (self._single_fetch_var.get() or "").strip()
+        if not pid_str:
+            self._log("[ERROR] 请输入 package ID")
+            return
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            self._log(f"[ERROR] 无效的 ID: {pid_str}")
+            return
+        if self.fetch_running:
+            self._log("[WARN] 正在获取中，请稍后再试")
+            return
+        self.fetch_running = True
+        self.fetch_btn.config(state=tk.DISABLED)
+        self._single_fetch_btn.config(state=tk.DISABLED)
+        self._single_fetch_status.config(text="单独拉取中...")
+        self.fetch_status.config(text="")
+        self._log(f"[SINGLE] 开始拉取 packageId={pid}")
+
+        def run():
+            try:
+                from fetch_package_info import fetch_one_package, load_config, load_cookie, OUTPUT_DIR
+
+                config = load_config()
+                bearer = (config.get("bearer_token") or "").strip()
+                cookie = load_cookie()
+                if not cookie:
+                    raise ValueError("cookie.txt 为空，请先配置 cookie")
+                timeout = int(config.get("request_timeout_sec") or 60)
+                # 优先从 purchases 中取真实 displayName，与「开始获取」逻辑一致
+                item = None
+                for p in getattr(self, "purchases", []) or []:
+                    if str(p.get("packageId", "")) == str(pid):
+                        item = dict(p)
+                        break
+                if not item:
+                    item = {"packageId": pid, "displayName": f"asset_{pid}"}
+                result = fetch_one_package(item, bearer, cookie, config, timeout)
+                out_file = OUTPUT_DIR / f"{pid}.json"
+                out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                ok = bool(result.get("detail"))
+                self.root.after(0, lambda: self._single_fetch_done(pid, ok))
+            except Exception as e:
+                self.root.after(0, lambda x=str(e): self._single_fetch_error(x))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _single_fetch_done(self, pid: int, ok: bool):
+        self.fetch_running = False
+        self.fetch_btn.config(state=tk.NORMAL)
+        self._single_fetch_btn.config(state=tk.NORMAL)
+        self._single_fetch_status.config(text=f"单独拉取完成: {'成功' if ok else '失败'}")
+        self._log(f"[DONE] packageId={pid} 已保存到 {METADATA_DIR}")
+        self._refresh()
+
+    def _single_fetch_error(self, err: str):
+        self.fetch_running = False
+        self.fetch_btn.config(state=tk.NORMAL)
+        self._single_fetch_btn.config(state=tk.NORMAL)
+        self._single_fetch_status.config(text="错误")
+        self._log(f"[ERROR] {err}")
 
     def _start_fetch(self):
         if self.fetch_running:
@@ -1841,7 +2282,11 @@ class PackageViewerApp:
         self._fetch_stop_requested = False
         self.fetch_btn.config(state=tk.DISABLED)
         self._fetch_stop_btn.config(state=tk.NORMAL)
+        if getattr(self, "_single_fetch_btn", None) and self._single_fetch_btn.winfo_exists():
+            self._single_fetch_btn.config(state=tk.DISABLED)
         self.fetch_status.config(text="获取中...")
+        if getattr(self, "_single_fetch_status", None) and self._single_fetch_status.winfo_exists():
+            self._single_fetch_status.config(text="")
         self.fetch_log.delete(1.0, tk.END)
         self._log(f"开始获取 (限制={limit or '全部'})...")
 
@@ -1870,6 +2315,8 @@ class PackageViewerApp:
         self.fetch_running = False
         self.fetch_btn.config(state=tk.NORMAL)
         self._fetch_stop_btn.config(state=tk.DISABLED)
+        if getattr(self, "_single_fetch_btn", None) and self._single_fetch_btn.winfo_exists():
+            self._single_fetch_btn.config(state=tk.NORMAL)
         stopped = getattr(self, "_fetch_stop_requested", False)
         status_text = "已停止" if stopped else f"完成: 成功={success}, 失败={failed}, 跳过={skipped}"
         self.fetch_status.config(text=status_text)
@@ -1882,6 +2329,8 @@ class PackageViewerApp:
         self.fetch_running = False
         self.fetch_btn.config(state=tk.NORMAL)
         self._fetch_stop_btn.config(state=tk.DISABLED)
+        if getattr(self, "_single_fetch_btn", None) and self._single_fetch_btn.winfo_exists():
+            self._single_fetch_btn.config(state=tk.NORMAL)
         self.fetch_status.config(text="错误")
         self._log(f"\n[ERROR] {err}")
 

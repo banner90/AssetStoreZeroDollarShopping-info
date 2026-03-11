@@ -321,7 +321,7 @@ def try_assetstore_html(cookie: str, package_id: int, display_name: str) -> Opti
                 if td:
                     try:
                         raw_val = td.group(1)
-                        desc = raw_val.encode("utf-8").decode("unicode_escape")
+                        desc = _safe_unescape_json_str(raw_val)
                         if len(desc) > 20:
                             return {"technicalDetails": desc, "source": "html_parse"}
                     except Exception:
@@ -339,14 +339,14 @@ def try_assetstore_html(cookie: str, package_id: int, display_name: str) -> Opti
                     m = re.search(r'"description"\s*:\s*"([^"]*(?:\\.[^"]*)*)"', html)
                     if m:
                         try:
-                            base["description"] = m.group(1).encode("utf-8").decode("unicode_escape")
+                            base["description"] = _safe_unescape_json_str(m.group(1))
                         except Exception:
                             pass
                     return base
             m = re.search(r'"description"\s*:\s*"([^"]*(?:\\.[^"]*)*)"', html)
             if m:
                 try:
-                    desc = m.group(1).encode("utf-8").decode("unicode_escape")
+                    desc = _safe_unescape_json_str(m.group(1))
                     return {"description": desc, "source": "html_parse"}
                 except Exception:
                     pass
@@ -410,6 +410,24 @@ def _build_technical_from_uploads(detail: Dict) -> Optional[str]:
         html_parts.append(f"<tr><td>{_escape_html_attr(str(k))}</td><td>{_escape_html_attr(str(v))}</td></tr>")
     html_parts.append("</tbody></table>")
     return "".join(html_parts)
+
+
+def _safe_unescape_json_str(raw_val: str) -> str:
+    """
+    安全地反转义 JSON 字符串中的 \\uXXXX 和 \\UXXXXXXXX。
+    若字符串已含原生 Unicode（如 emoji），不会损坏。
+    """
+    if not raw_val or ("\\u" not in raw_val and "\\U" not in raw_val):
+        return raw_val
+    try:
+        # 仅替换转义序列，保留已有 Unicode 字符
+        def replace_u(m):
+            return chr(int(m.group(1), 16))
+        out = re.sub(r"\\u([0-9a-fA-F]{4})", replace_u, raw_val)
+        out = re.sub(r"\\U([0-9a-fA-F]{8})", replace_u, out)
+        return out
+    except Exception:
+        return raw_val
 
 
 def _escape_html_attr(text: str) -> str:
@@ -599,6 +617,16 @@ def run_fetch(
         new_detail = result.get("detail")
         old_detail = existing.get("detail") if existing else None
         if new_detail and old_detail and _detail_equal(new_detail, old_detail):
+            # detail 相同则跳过写入，但若 displayName/fromSnapshot 不同（如单独拉取曾用 asset_xxx），仍更新顶层字段
+            if existing and (
+                str(existing.get("displayName")) != str(result.get("displayName", ""))
+                or existing.get("fromSnapshot") != result.get("fromSnapshot")
+            ):
+                merged = dict(existing)
+                merged["displayName"] = result.get("displayName", merged["displayName"])
+                merged["fromSnapshot"] = result.get("fromSnapshot", merged["fromSnapshot"])
+                out_file.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+                return i, total, pid, str(item.get("displayName") or "?"), True, "ok"
             return i, total, pid, str(item.get("displayName") or "?"), False, "skipped"
         if not new_detail and old_detail:
             return i, total, pid, str(item.get("displayName") or "?"), False, "failed"
@@ -685,6 +713,7 @@ def main() -> int:
     import argparse
     parser = argparse.ArgumentParser(description="从 purchases_snapshot 抓取包详情")
     parser.add_argument("--limit", type=int, default=0, help="限制抓取数量，0=全部")
+    parser.add_argument("--package-id", type=int, default=0, help="仅拉取指定 packageId（如 14656），用于测试")
     args = parser.parse_args()
 
     print("Package Info Fetcher - 从 purchases_snapshot 抓取包详情")
@@ -694,6 +723,21 @@ def main() -> int:
     if not cookie:
         print("[ERROR] cookie.txt 为空，请先配置 cookie")
         return 1
+    single_pid = args.package_id
+    if single_pid:
+        purchases = [{"packageId": single_pid, "displayName": f"asset_{single_pid}"}]
+        print(f"[INFO] 仅拉取 packageId={single_pid}")
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] 元数据库目录: {OUTPUT_DIR}")
+        timeout = int(config.get("request_timeout_sec") or 60)
+        result = fetch_one_package(purchases[0], bearer, cookie, config, timeout)
+        out_file = OUTPUT_DIR / f"{single_pid}.json"
+        out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        if result.get("detail"):
+            print(f"[OK] 已保存到 {out_file}")
+            return 0
+        print("[FAIL] 未能获取详情")
+        return 2
     try:
         purchases = load_purchases()
     except Exception as e:
