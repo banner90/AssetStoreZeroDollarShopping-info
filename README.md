@@ -88,3 +88,11 @@ AssetStoreZeroDollarShopping/
 感谢 [@UlyssesWu](https://github.com/UlyssesWu) 及其项目 [AssetStoreZeroDollarShopping](https://github.com/UlyssesWu/AssetStoreZeroDollarShopping)，为本工具提供了配置、已购列表和 Cookie 的数据来源。
 
 本次合作已受到原作者许可。
+
+---
+
+## 声明
+
+本工具仅用于保存和备份用户本人已拥有的库存资源信息，请勿滥用或用于侵害他人权益。
+
+因不当使用本工具所造成的任何后果，由使用者自行承担。
