@@ -892,7 +892,7 @@ class PackageViewerApp:
         btn_row.pack(anchor=tk.W, pady=(6, 0))
         self._refresh_btn = tk.Button(
             btn_row,
-            text="刷新列表",
+            text="更新包下载状态",
             command=self._refresh,
             font=("Segoe UI", 10),
             bg=self._THEME_LIGHT["btn_bg"],
