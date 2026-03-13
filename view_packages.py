@@ -39,6 +39,7 @@ else:
 
 CONFIG_PATH = ROOT / "asset_store_config.json"
 PURCHASES_PATH = ROOT / "purchases_snapshot.json"
+MANUAL_MAPPING_PATH = ROOT / "manual_mapping.json"
 PLUGIN_JSON = _BASE / "plugin.json"
 METADATA_DIR = _BASE / "metadata" if not getattr(sys, "frozen", False) else ROOT / "metadata"
 EMOJI_CACHE_DIR = ROOT / "emoji"
@@ -123,6 +124,26 @@ def load_purchases() -> list:
         return []
     data = json.loads(PURCHASES_PATH.read_text(encoding="utf-8"))
     return data if isinstance(data, list) else []
+
+
+def load_manual_mapping() -> dict:
+    """加载 manual_mapping.json：packageId(str) -> filename"""
+    if not MANUAL_MAPPING_PATH.exists():
+        return {}
+    try:
+        data = json.loads(MANUAL_MAPPING_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_manual_mapping(mapping: dict) -> None:
+    """保存 manual_mapping.json，去重后写入"""
+    out = {str(k): str(v) for k, v in mapping.items()}
+    MANUAL_MAPPING_PATH.write_text(
+        json.dumps(out, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def build_filename_to_package_id(purchases: list) -> dict:
@@ -870,6 +891,14 @@ class PackageViewerApp:
         )
         self._path_label.pack(side=tk.LEFT, fill=tk.X, expand=True, anchor=tk.W)
         self._theme_frames_bg.append(tab1_hint_row)
+        tab1_manual_hint = tk.Frame(tab1, bg=self._web_bg)
+        tab1_manual_hint.pack(fill=tk.X)
+        self._theme_frames_bg.append(tab1_manual_hint)
+        ttk.Label(
+            tab1_manual_hint,
+            text="手动映射数据保存在 manual_mapping.json，注意备份",
+            style="Web.TLabel",
+        ).pack(side=tk.LEFT, anchor=tk.W)
         if not self.download_dir.exists():
             ttk.Label(tab1, text="(目录不存在)", style="Web.TLabel", foreground="red").pack(anchor=tk.W)
 
@@ -1004,8 +1033,22 @@ class PackageViewerApp:
             )
             self.detail_widget.pack(fill=tk.BOTH, expand=True)
 
-        # 嵌入详情区域内部的右上角：返回文档、在Unity中打开
+        # 嵌入详情区域内部的右上角：返回文档、在Unity中打开、手动映射/取消映射
         _open_btn_border = "#1565c0"
+        _manual_btn_border = "#c62828"  # 红色描边
+        _btn_style = {
+            "font": ("Segoe UI", 10),
+            "bg": "#ffffff",
+            "fg": "#212121",
+            "activebackground": "#f5f5f5",
+            "activeforeground": "#212121",
+            "relief": tk.FLAT,
+            "bd": 0,
+            "padx": 12,
+            "pady": 6,
+            "cursor": "hand2",
+        }
+        _manual_btn_style = {**_btn_style, "width": 14}
         self._open_in_unity_frame = tk.Frame(self.detail_container, bg=_open_btn_border, padx=1, pady=1)
         self._open_in_unity_frame.place(relx=1, rely=0, x=-32, y=36, anchor=tk.NE)
         self._open_in_unity_frame.lift()
@@ -1013,18 +1056,25 @@ class PackageViewerApp:
             self._open_in_unity_frame,
             text="在Unity中打开",
             command=self._open_in_unity,
-            font=("Segoe UI", 10),
-            bg="#ffffff",
-            fg="#212121",
-            activebackground="#f5f5f5",
-            activeforeground="#212121",
-            relief=tk.FLAT,
-            bd=0,
-            padx=12,
-            pady=6,
-            cursor="hand2",
+            width=14,
+            **_btn_style,
         )
         self._open_in_unity_btn.pack()
+        self._manual_map_frame = tk.Frame(self.detail_container, bg=_manual_btn_border, padx=1, pady=1)
+        self._manual_map_frame.place(relx=1, rely=0, x=-32, y=92, anchor=tk.NE)
+        self._manual_map_frame.lift()
+        self._manual_map_btn = tk.Button(
+            self._manual_map_frame,
+            text="手动映射",
+            command=self._on_manual_map_click,
+            **_manual_btn_style,
+        )
+        self._unmap_btn = tk.Button(
+            self._manual_map_frame,
+            text="取消映射",
+            command=self._on_unmap_click,
+            **_manual_btn_style,
+        )
         self._update_open_in_unity_visibility()
 
         self._back_to_doc_frame = tk.Frame(self.detail_container, bg=_open_btn_border, padx=1, pady=1)
@@ -1367,23 +1417,51 @@ class PackageViewerApp:
             self._show_html_with_async_emoji(ddata, extra_notice=extra, dark=self._dark_theme)
 
     def _update_open_in_unity_visibility(self):
-        """仅当有选中且选中项为已下载资源时显示「在Unity中打开」按钮"""
-        frame = getattr(self, "_open_in_unity_frame", None)
-        if not frame or not frame.winfo_exists():
+        """根据选中项类型显示：missing 显示「手动映射」；existing 显示「在Unity中打开」；manual-mapped 额外显示「取消映射」（在下方固定位置，红边）"""
+        open_frame = getattr(self, "_open_in_unity_frame", None)
+        manual_frame = getattr(self, "_manual_map_frame", None)
+        open_btn = getattr(self, "_open_in_unity_btn", None)
+        manual_btn = getattr(self, "_manual_map_btn", None)
+        unmap_btn = getattr(self, "_unmap_btn", None)
+        if not open_frame or not open_frame.winfo_exists():
             return
         sel = self.listbox.curselection()
         if not sel:
-            frame.place_forget()
+            open_frame.place_forget()
+            if manual_frame and manual_frame.winfo_exists():
+                manual_frame.place_forget()
             self._update_back_to_doc_visibility()
             return
         idx = sel[0]
         item = self.listbox_map.get(idx)
-        if item is None or isinstance(item, dict):
-            frame.place_forget()
+        if item is None:
+            open_frame.place_forget()
+            if manual_frame and manual_frame.winfo_exists():
+                manual_frame.place_forget()
             self._update_back_to_doc_visibility()
             return
-        frame.place(relx=1, rely=0, x=-32, y=36, anchor=tk.NE)
-        frame.lift()
+        manual = load_manual_mapping()
+        if isinstance(item, dict):
+            open_frame.place_forget()
+            manual_frame.place(relx=1, rely=0, x=-32, y=36, anchor=tk.NE)
+            unmap_btn.pack_forget()
+            manual_btn.pack()
+        else:
+            open_frame.place(relx=1, rely=0, x=-32, y=36, anchor=tk.NE)
+            open_frame.lift()
+            filename = item.name if hasattr(item, "name") else str(item)
+            pid = self.filename_to_pid.get(filename)
+            pid_str = str(int(pid)) if isinstance(pid, (int, float)) else (str(pid) if pid is not None else "")
+            is_manual = pid_str in manual and manual.get(pid_str) == filename
+            if is_manual:
+                manual_frame.place(relx=1, rely=0, x=-32, y=92, anchor=tk.NE)
+                manual_frame.lift()
+                manual_btn.pack_forget()
+                unmap_btn.pack()
+            else:
+                manual_frame.place_forget()
+        if manual_frame and manual_frame.winfo_exists():
+            manual_frame.lift()
         self._update_back_to_doc_visibility()
 
     def _open_in_unity(self):
@@ -1417,6 +1495,140 @@ class PackageViewerApp:
             os.startfile(str(package_path))
         except Exception as e:
             messagebox.showerror("在Unity中打开", f"打开失败：{e}")
+
+    def _fuzzy_match_files(self, display_name: str) -> list:
+        """根据 displayName 模糊搜索下载目录中的 .unitypackage 文件"""
+        words = set(re.findall(r"[a-zA-Z0-9\u4e00-\u9fff]+", display_name.lower()))
+        words = {w for w in words if len(w) > 1}
+        if not words:
+            return list(self.download_dir.glob("*.unitypackage"))[:30]
+        candidates = []
+        for p in self.download_dir.glob("*.unitypackage"):
+            stem = p.stem.lower()
+            score = sum(1 for w in words if w in stem)
+            if score > 0:
+                candidates.append((score, p))
+        candidates.sort(key=lambda x: -x[0])
+        return [p for _, p in candidates[:20]]
+
+    def _on_manual_map_click(self):
+        """手动映射：模糊搜索候选文件，用户选择后写入映射"""
+        sel = self.listbox.curselection()
+        if not sel:
+            messagebox.showinfo("手动映射", "请先在左侧列表中选中一个缺失文件的资源。")
+            return
+        idx = sel[0]
+        item = self.listbox_map.get(idx)
+        if not item or not isinstance(item, dict):
+            messagebox.showinfo("手动映射", "请选中标记为红色的缺失资源。")
+            return
+        display_name = item.get("displayName") or ""
+        pid = item.get("packageId")
+        if not pid:
+            messagebox.showerror("手动映射", "无法获取 packageId。")
+            return
+        pid_str = str(int(pid)) if isinstance(pid, (int, float)) else str(pid)
+        candidates = self._fuzzy_match_files(display_name)
+        if not candidates:
+            messagebox.showinfo("手动映射", "未在下载目录中找到匹配的文件。")
+            return
+
+        self.root.update_idletasks()
+        frame = getattr(self, "_manual_map_frame", None)
+        win = tk.Toplevel(self.root)
+        win.title("选择对应文件")
+        win.transient(self.root)
+        win.grab_set()
+        if frame and frame.winfo_exists():
+            bx = frame.winfo_rootx()
+            by = frame.winfo_rooty() + frame.winfo_height()
+            fw = frame.winfo_width()
+            wx, wy = 500, 300
+            win_x = bx + fw - wx
+            win_x = max(0, win_x)
+            win.geometry(f"{wx}x{wy}+{win_x}+{by}")
+        else:
+            win.geometry("500x300")
+        lb = tk.Listbox(win, font=("Segoe UI", 10), selectmode=tk.SINGLE)
+        sb = ttk.Scrollbar(win, orient=tk.VERTICAL, command=lb.yview)
+        for p in candidates:
+            lb.insert(tk.END, p.name)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        lb.config(yscrollcommand=sb.set)
+        if candidates:
+            lb.selection_set(0)
+
+        def on_confirm():
+            sel_idx = lb.curselection()
+            if not sel_idx:
+                return
+            chosen = candidates[sel_idx[0]]
+            chosen_name = chosen.name
+            mapping = load_manual_mapping()
+            mapping[pid_str] = chosen_name
+            save_manual_mapping(mapping)
+            win.destroy()
+            self._refresh()
+            self._update_open_in_unity_visibility()
+            self._refresh_detail_after_mapping(chosen_name)
+
+        def on_cancel():
+            win.destroy()
+
+        btn_frame = tk.Frame(win)
+        btn_frame.pack(fill=tk.X, padx=8, pady=8)
+        tk.Button(btn_frame, text="确认", command=on_confirm, font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_frame, text="取消", command=on_cancel, font=("Segoe UI", 10)).pack(side=tk.LEFT)
+        lb.bind("<Double-1>", lambda e: on_confirm())
+
+    def _refresh_detail_after_mapping(self, chosen_filename: str = "", pid_str: str = ""):
+        """映射/取消映射后刷新当前详情，可选重新选中指定文件或缺失项"""
+        if chosen_filename:
+            for idx, data in self.listbox_map.items():
+                if hasattr(data, "name") and data.name == chosen_filename:
+                    self.listbox.selection_clear(0, tk.END)
+                    self.listbox.selection_set(idx)
+                    self.listbox.see(idx)
+                    break
+        elif pid_str:
+            for idx, data in self.listbox_map.items():
+                if isinstance(data, dict):
+                    p = data.get("packageId")
+                    pstr = str(int(p)) if isinstance(p, (int, float)) else str(p) if p else ""
+                    if pstr == pid_str:
+                        self.listbox.selection_clear(0, tk.END)
+                        self.listbox.selection_set(idx)
+                        self.listbox.see(idx)
+                        break
+        sel = self.listbox.curselection()
+        if sel:
+            self._on_select(None)
+
+    def _on_unmap_click(self):
+        """取消手动映射"""
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        item = self.listbox_map.get(idx)
+        if not item or isinstance(item, dict):
+            messagebox.showinfo("取消映射", "请选中已通过手动映射关联的资源。")
+            return
+        filename = item.name if hasattr(item, "name") else str(item)
+        package_id = self.filename_to_pid.get(filename)
+        if package_id is None:
+            return
+        pid_str = str(int(package_id)) if isinstance(package_id, (int, float)) else str(package_id)
+        mapping = load_manual_mapping()
+        if pid_str not in mapping:
+            messagebox.showinfo("取消映射", "该资源非手动映射，无需取消。")
+            return
+        del mapping[pid_str]
+        save_manual_mapping(mapping)
+        self._refresh()
+        self._update_open_in_unity_visibility()
+        self._refresh_detail_after_mapping(pid_str=pid_str)
 
     def _show_detail_view(self):
         """显示包详情视图（选中列表项或点击关闭筛选时调用）"""
@@ -1500,7 +1712,12 @@ class PackageViewerApp:
         if getattr(self, "_theme_btn", None) and self._theme_btn.winfo_exists():
             self._theme_btn.config(bg=self._web_bg, fg=theme_fg, text=theme_text)
         if getattr(self, "_open_in_unity_frame", None) and self._open_in_unity_frame.winfo_exists():
-            self._open_in_unity_btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
+            if self._open_in_unity_btn and self._open_in_unity_btn.winfo_exists():
+                self._open_in_unity_btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
+        if getattr(self, "_manual_map_frame", None) and self._manual_map_frame.winfo_exists():
+            for btn in (self._manual_map_btn, self._unmap_btn):
+                if btn and btn.winfo_exists():
+                    btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
         if getattr(self, "_back_to_doc_frame", None) and self._back_to_doc_frame.winfo_exists():
             self._back_to_doc_btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
         if getattr(self, "_filter_clear_btn", None) and self._filter_clear_btn.winfo_exists():
@@ -2042,6 +2259,7 @@ class PackageViewerApp:
         existing_files = list(self.download_dir.glob("*.unitypackage"))
         existing_names = {p.name for p in existing_files}
         self.package_files = list(existing_files)
+        manual = load_manual_mapping()
 
         self.purchase_order = {}
         purchased_downloaded = 0  # 购买列表中、对应文件已存在的数量
@@ -2054,6 +2272,14 @@ class PackageViewerApp:
                 self.filename_to_display_name[fn] = display_name
                 self.purchase_order[fn] = grant_time
             if not display_name or not pid:
+                continue
+            pid_str = str(int(pid)) if isinstance(pid, (int, float)) else str(pid)
+            manual_fn = manual.get(pid_str)
+            if manual_fn and manual_fn in existing_names:
+                purchased_downloaded += 1
+                self.filename_to_pid[manual_fn] = int(pid) if isinstance(pid, (int, float)) else pid
+                self.filename_to_display_name[manual_fn] = display_name
+                self.purchase_order[manual_fn] = grant_time
                 continue
             filename = sanitize_filename(display_name) + ".unitypackage"
             if filename in existing_names:
