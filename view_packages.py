@@ -41,6 +41,7 @@ CONFIG_PATH = ROOT / "asset_store_config.json"
 PURCHASES_PATH = ROOT / "purchases_snapshot.json"
 PLUGIN_JSON = _BASE / "plugin.json"
 METADATA_DIR = _BASE / "metadata" if not getattr(sys, "frozen", False) else ROOT / "metadata"
+EMOJI_CACHE_DIR = ROOT / "emoji"
 # 图标：打包后从 _MEIPASS 读取；开发时从 build/icon.png 或根目录 icon.png 读取
 if getattr(sys, "frozen", False):
     ICON_PATH = _MEIPASS / "icon.png"
@@ -237,8 +238,15 @@ def _get_effective_emoji_style() -> str:
     return (raw or _get_platform_default_emoji_style()).strip().lower()
 
 
+def _emoji_cache_file(primary: str, emoji_char: str, size: int = 18) -> Path:
+    """按风格/字符/尺寸生成本地缓存文件路径（ROOT/emoji）。"""
+    codepoints = "-".join(f"{ord(ch):x}" for ch in emoji_char)
+    safe_primary = re.sub(r"[^a-z0-9_-]", "_", (primary or "twemoji").lower())
+    return EMOJI_CACHE_DIR / f"{safe_primary}_{size}_{codepoints}.png"
+
+
 def _render_emoji_to_data_url(emoji_char: str, size: int = 18) -> str | None:
-    """从 CDN 源获取 emoji 图片并缩放为 PNG data URL，失败返回 None"""
+    """优先读本地缓存；未命中时从 CDN 获取并写入 ROOT/emoji 缓存。"""
     if not HAS_PILMOJI or not emoji_char:
         return None
     primary = _get_effective_emoji_style()
@@ -249,10 +257,22 @@ def _render_emoji_to_data_url(emoji_char: str, size: int = 18) -> str | None:
         return None
     import base64
     import io
+    cache_file = _emoji_cache_file(primary, emoji_char, size)
+    try:
+        if cache_file.exists():
+            b64 = base64.b64encode(cache_file.read_bytes()).decode("ascii")
+            url = f"data:image/png;base64,{b64}"
+            _EMOJI_IMG_CACHE[cache_key] = url
+            return url
+    except Exception:
+        pass
     source = _get_pilmoji_source(primary)
     if source is None:
-        from pilmoji.source import Twemoji
-        source = Twemoji()
+        try:
+            from pilmoji.source import Twemoji
+            source = Twemoji()
+        except ImportError:
+            return None
     try:
         stream = source.get_emoji(emoji_char)
         if stream:
@@ -260,7 +280,13 @@ def _render_emoji_to_data_url(emoji_char: str, size: int = 18) -> str | None:
             resized = orig.resize((size, size), Image.LANCZOS)
             buf = io.BytesIO()
             resized.save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            png_bytes = buf.getvalue()
+            try:
+                EMOJI_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                cache_file.write_bytes(png_bytes)
+            except Exception:
+                pass
+            b64 = base64.b64encode(png_bytes).decode("ascii")
             url = f"data:image/png;base64,{b64}"
             _EMOJI_IMG_CACHE[cache_key] = url
             return url
@@ -304,10 +330,12 @@ def _prefetch_emoji_batch(chars: list[str], callback=None):
         return
 
     def _worker():
-        for char in uncached:
-            _render_emoji_to_data_url(char)
-        if callback:
-            callback()
+        try:
+            for char in uncached:
+                _render_emoji_to_data_url(char)
+        finally:
+            if callback:
+                callback()
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
@@ -945,6 +973,17 @@ class PackageViewerApp:
                 font=("Segoe UI", 9),
             ).pack(side=tk.LEFT, anchor=tk.W)
             self._theme_frames_bg.append(_no_html_hint)
+        if self._use_html and not HAS_PILMOJI and not getattr(sys, "frozen", False):
+            _no_pilmoji_hint = tk.Frame(self.detail_container, bg=self._web_bg, pady=4)
+            _no_pilmoji_hint.pack(fill=tk.X)
+            ttk.Label(
+                _no_pilmoji_hint,
+                style="Web.TLabel",
+                text=f"(未检测到 pilmoji，emoji 图片将使用文本符号代替。请在插件页签安装「{_get_plugin_title_by_id('pilmoji', 'emoji表情包')}」)",
+                foreground=self._web_fg_muted,
+                font=("Segoe UI", 9),
+            ).pack(side=tk.LEFT, anchor=tk.W)
+            self._theme_frames_bg.append(_no_pilmoji_hint)
         if self._use_html:
             self.detail_widget = HtmlFrame(
                 self.detail_container,
@@ -2243,7 +2282,9 @@ class PackageViewerApp:
 
         def _on_done():
             try:
-                self.root.after(0, self._refresh_emoji_if_same, pid, data, extra_notice)
+                def _on_main():
+                    self._refresh_emoji_if_same(pid, data, extra_notice)
+                self.root.after(0, _on_main)
             except Exception:
                 pass
 

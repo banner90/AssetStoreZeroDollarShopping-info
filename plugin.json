@@ -7,6 +7,12 @@
       "title": "网页风格",
       "command": "python -m pip install tkinterweb",
       "description": "包详情以 HTML 形式展示，支持超链接、表格、技术细节等。未安装时将使用纯文本显示。"
+    },
+    {
+      "id": "pilmoji",
+      "title": "emoji表情包",
+      "command": "python -m pip install pilmoji",
+      "description": "用于下载并渲染详情页中的 emoji 图片。未安装时将仅显示文本替代符号。"
     }
   ]
 }
