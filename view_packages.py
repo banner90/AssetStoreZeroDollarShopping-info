@@ -50,7 +50,7 @@ else:
 
 
 def _load_plugins():
-    """从 plugin.json 读取插件配置，返回 (hint, plugins_list)。plugins_list 每项为 {title, command, description}。未识别到 json 时返回空列表，不填充默认插件。"""
+    """从 plugin.json 读取插件配置，返回 (hint, plugins_list)。plugins_list 每项为 {id, title, command, description}。未识别到 json 时返回空列表，不填充默认插件。"""
     default_hint = "以下插件可增强本工具功能，安装后需重启程序生效。作者会根据实际需要更新插件文件，不需要用户自行修改。"
     if not PLUGIN_JSON.exists():
         return default_hint, []
@@ -70,6 +70,7 @@ def _load_plugins():
             else:
                 cmd = str(p.get("command", ""))
             plugins.append({
+                "id": str(p.get("id", "")),
                 "title": str(p.get("title", "")),
                 "command": cmd,
                 "description": str(p.get("description", "")),
@@ -77,6 +78,20 @@ def _load_plugins():
         return hint, plugins
     except Exception:
         return default_hint, []
+
+
+def _get_plugin_title_by_id(plugin_id: str, fallback: str = "") -> str:
+    """从 plugin.json 根据插件 id 读取对应插件的 title。未找到或读取失败时返回 fallback。"""
+    if not PLUGIN_JSON.exists():
+        return fallback
+    try:
+        data = json.loads(PLUGIN_JSON.read_text(encoding="utf-8"))
+        for p in data.get("plugins") or []:
+            if isinstance(p, dict) and p.get("id") == plugin_id:
+                return str(p.get("title", fallback)) or fallback
+        return fallback
+    except Exception:
+        return fallback
 
 
 def _load_version() -> str:
@@ -918,13 +933,14 @@ class PackageViewerApp:
         self._theme_frames_bg.extend([right_frame, self.detail_container, self.filter_container])
 
         self._use_html = HAS_HTML_FRAME
-        if not self._use_html:
+        if not self._use_html and not getattr(sys, "frozen", False):
+            # 仅 Python 直接运行时显示；exe 模式下不显示此提示
             _no_html_hint = tk.Frame(self.detail_container, bg=self._web_bg, pady=4)
             _no_html_hint.pack(fill=tk.X)
             ttk.Label(
                 _no_html_hint,
                 style="Web.TLabel",
-                text="(未检测到 tkinterweb，当前为纯文本模式。运行 pip install tkinterweb 后可显示可点击超链接)",
+                text=f"(未检测到 tkinterweb，当前为纯文本模式。请在插件页签安装「{_get_plugin_title_by_id('tkinterweb', '网页风格')}」)",
                 foreground=self._web_fg_muted,
                 font=("Segoe UI", 9),
             ).pack(side=tk.LEFT, anchor=tk.W)
@@ -1961,6 +1977,7 @@ class PackageViewerApp:
     def _refresh(self):
         self.package_files = []
         self.missing_items = []
+        self.filename_to_display_name = {}  # 文件名 -> 资源显示名（来自 purchases displayName）
         if not self.download_dir.exists():
             self.purchase_order = {}
             for item in self.purchases:
@@ -1969,6 +1986,7 @@ class PackageViewerApp:
                 grant_time = str(item.get("grantTime") or "9999-99-99")
                 if display_name and pid:
                     fn = sanitize_filename(display_name) + ".unitypackage"
+                    self.filename_to_display_name[fn] = display_name
                     self.purchase_order[fn] = grant_time
                     self.missing_items.append({
                         "filename": fn,
@@ -1994,6 +2012,7 @@ class PackageViewerApp:
             grant_time = str(item.get("grantTime") or "9999-99-99")
             if display_name:
                 fn = sanitize_filename(display_name) + ".unitypackage"
+                self.filename_to_display_name[fn] = display_name
                 self.purchase_order[fn] = grant_time
             if not display_name or not pid:
                 continue
@@ -2046,10 +2065,11 @@ class PackageViewerApp:
             return
         if keyword:
             for p in self.package_files:
-                if keyword in p.name.lower():
+                display_name = (getattr(self, "filename_to_display_name", {}) or {}).get(p.name) or p.name
+                if keyword in p.name.lower() or keyword in display_name.lower():
                     items.append(("existing", p))
             for m in self.missing_items:
-                if keyword in m["filename"].lower():
+                if keyword in m["filename"].lower() or keyword in (m.get("displayName") or "").lower():
                     items.append(("missing", m))
         else:
             for p in self.package_files:
@@ -2123,12 +2143,13 @@ class PackageViewerApp:
 
         for i, (typ, data) in enumerate(items):
             if typ == "existing":
-                name = data.name
+                # 有 displayName 时显示资源名（无后缀），否则显示文件名（带 .unitypackage）
+                display_name = (getattr(self, "filename_to_display_name", {}) or {}).get(data.name) or data.name
                 self.listbox_map[i] = data
+                self.listbox.insert(tk.END, display_name)
             else:
-                name = data["filename"]
                 self.listbox_map[i] = data
-            self.listbox.insert(tk.END, name)
+                self.listbox.insert(tk.END, data["displayName"])
             if typ == "missing":
                 self.listbox.itemconfig(i, fg="red")
 

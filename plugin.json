@@ -1,7 +1,9 @@
 {
+  "tkinterweb_plugin_id": "tkinterweb",
   "hint": "以下插件可增强本工具功能，安装后需重启程序生效。作者会根据实际需要更新插件文件，不需要用户自行修改。",
   "plugins": [
     {
+      "id": "tkinterweb",
       "title": "网页风格",
       "command": "python -m pip install tkinterweb",
       "description": "包详情以 HTML 形式展示，支持超链接、表格、技术细节等。未安装时将使用纯文本显示。"
