@@ -52,7 +52,7 @@ else:
 
 def _load_plugins():
     """从 plugin.json 读取插件配置，返回 (hint, plugins_list)。plugins_list 每项为 {id, title, command, description}。未识别到 json 时返回空列表，不填充默认插件。"""
-    default_hint = "以下插件可增强本工具功能，安装后需重启程序生效。作者会根据实际需要更新插件文件，不需要用户自行修改。"
+    default_hint = "以下插件可用于非exe运行时(exe运行可忽略)，根据提示安装，安装后需重启程序生效。(作者会根据实际需要更新插件文件，不需要用户自行修改)"
     if not PLUGIN_JSON.exists():
         return default_hint, []
     try:
