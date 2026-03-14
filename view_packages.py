@@ -8,7 +8,7 @@ import re
 import subprocess
 import sys
 import webbrowser
-from datetime import datetime
+from datetime import date, datetime
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -40,7 +40,9 @@ else:
 CONFIG_PATH = ROOT / "asset_store_config.json"
 PURCHASES_PATH = ROOT / "purchases_snapshot.json"
 MANUAL_MAPPING_PATH = ROOT / "manual_mapping.json"
-PLUGIN_JSON = _BASE / "plugin.json"
+# 2026-03-31 下架资产清单，与 exe 同目录（当前所在目录）
+ASSETS_REMOVED_PATH = ROOT / "assets_removed_march31.json"
+PLUGIN_JSON = ROOT / "plugin.json"  # 与 exe 同目录
 METADATA_DIR = _BASE / "metadata" if not getattr(sys, "frozen", False) else ROOT / "metadata"
 EMOJI_CACHE_DIR = ROOT / "emoji"
 # 图标：打包后从 _MEIPASS 读取；开发时从 build/icon.png 或根目录 icon.png 读取
@@ -107,6 +109,14 @@ def _load_version() -> str:
     return ""
 
 
+def _normalize_fullwidth(s: str) -> str:
+    """全角标点转半角，便于与 unity_assets_downloader 输出的文件名匹配"""
+    if not s:
+        return s
+    tbl = str.maketrans("：　（）［］【】＇＂，．／－～！？｛｝", ": ()[][]'\",./-~!?{}")
+    return s.translate(tbl)
+
+
 def sanitize_filename(name: str) -> str:
     sanitized = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip()
     sanitized = sanitized.rstrip(". ")
@@ -144,6 +154,41 @@ def save_manual_mapping(mapping: dict) -> None:
         json.dumps(out, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+_ASSETS_REMOVED_CACHE = (None, 0.0)  # (data, mtime)
+
+
+def load_assets_removed() -> dict:
+    """加载 assets_removed_march31.json：packageId(str) -> {name, publisher}。优先 ROOT，其次当前工作目录。带缓存。"""
+    global _ASSETS_REMOVED_CACHE
+    for p in (ASSETS_REMOVED_PATH, Path.cwd() / "assets_removed_march31.json"):
+        if p.exists():
+            try:
+                mtime = p.stat().st_mtime
+                if _ASSETS_REMOVED_CACHE[0] is not None and _ASSETS_REMOVED_CACHE[1] == mtime:
+                    return _ASSETS_REMOVED_CACHE[0]
+                data = json.loads(p.read_text(encoding="utf-8"))
+                result = data if isinstance(data, dict) else {}
+                _ASSETS_REMOVED_CACHE = (result, mtime)
+                return result
+            except Exception:
+                pass
+    return {}
+
+
+def is_asset_removed(pid) -> bool:
+    """判断 packageId 是否在 2026-03-31 下架清单中"""
+    removed = load_assets_removed()
+    pid_str = str(int(pid)) if isinstance(pid, (int, float)) else str(pid)
+    return pid_str in removed
+
+
+def get_removed_asset_info(pid) -> dict | None:
+    """若 packageId 在下架清单中，返回 {name, publisher}，否则返回 None"""
+    removed = load_assets_removed()
+    pid_str = str(int(pid)) if isinstance(pid, (int, float)) else str(pid)
+    return removed.get(pid_str)
 
 
 def build_filename_to_package_id(purchases: list) -> dict:
@@ -808,7 +853,7 @@ class PackageViewerApp:
         self.package_files = []
         self.missing_items = []
         self.purchase_order = {}
-        self.sort_by_snapshot = True
+        self.sort_mode = 0  # 0=按购买顺序, 1=按字母排序
         self.listbox_map = {}
         self.fetch_running = False
 
@@ -948,22 +993,19 @@ class PackageViewerApp:
             cursor="hand2",
         )
         self.filter_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.listbox = tk.Listbox(
+        self.listbox = ttk.Treeview(
             left_frame,
-            font=("Segoe UI", 10),
-            selectmode=tk.SINGLE,
-            bg=self._web_card_bg,
-            fg=self._web_fg,
-            selectbackground=self._web_select_bg,
-            selectforeground=self._web_fg,
-            relief=tk.FLAT,
-            highlightthickness=0,
+            columns=(),
+            show="tree",
+            selectmode="browse",
+            height=20,
         )
         list_scroll = ttk.Scrollbar(left_frame, command=self.listbox.yview)
         self.listbox.configure(yscrollcommand=list_scroll.set)
+        self.listbox.tag_configure("missing", foreground="#c62828")  # 未下载（文件不存在）显示红色
         self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.listbox.bind("<<ListboxSelect>>", self._on_select)
+        self.listbox.bind("<<TreeviewSelect>>", self._on_select)
         self.listbox.bind("<MouseWheel>", lambda e: self.listbox.yview_scroll(int(-1 * (e.delta / 120)), "units"))
 
         btn_row = tk.Frame(left_container, bg=self._web_bg)
@@ -1431,14 +1473,14 @@ class PackageViewerApp:
         unmap_btn = getattr(self, "_unmap_btn", None)
         if not open_frame or not open_frame.winfo_exists():
             return
-        sel = self.listbox.curselection()
-        if not sel:
+        sel = self.listbox.selection()
+        idx = int(sel[0]) if sel else None
+        if idx is None:
             open_frame.place_forget()
             if manual_frame and manual_frame.winfo_exists():
                 manual_frame.place_forget()
             self._update_back_to_doc_visibility()
             return
-        idx = sel[0]
         item = self.listbox_map.get(idx)
         if item is None:
             open_frame.place_forget()
@@ -1472,11 +1514,11 @@ class PackageViewerApp:
 
     def _open_in_unity(self):
         """将当前选中的 .unitypackage 在 Unity 中打开导入（与 import_assets_to_unity.py 一致：先检查 Unity 是否运行，再 os.startfile）"""
-        sel = self.listbox.curselection()
-        if not sel:
+        sel = self.listbox.selection()
+        idx = int(sel[0]) if sel else None
+        if idx is None:
             messagebox.showinfo("在Unity中打开", "请先在左侧列表中选中一个已下载的资源。")
             return
-        idx = sel[0]
         item = self.listbox_map.get(idx)
         if not item:
             messagebox.showinfo("在Unity中打开", "请先在左侧列表中选中一个已下载的资源。")
@@ -1519,11 +1561,11 @@ class PackageViewerApp:
 
     def _on_manual_map_click(self):
         """手动映射：模糊搜索候选文件，用户选择后写入映射"""
-        sel = self.listbox.curselection()
-        if not sel:
+        sel = self.listbox.selection()
+        idx = int(sel[0]) if sel else None
+        if idx is None:
             messagebox.showinfo("手动映射", "请先在左侧列表中选中一个缺失文件的资源。")
             return
-        idx = sel[0]
         item = self.listbox_map.get(idx)
         if not item or not isinstance(item, dict):
             messagebox.showinfo("手动映射", "请选中标记为红色的缺失资源。")
@@ -1593,9 +1635,10 @@ class PackageViewerApp:
         if chosen_filename:
             for idx, data in self.listbox_map.items():
                 if hasattr(data, "name") and data.name == chosen_filename:
-                    self.listbox.selection_clear(0, tk.END)
-                    self.listbox.selection_set(idx)
-                    self.listbox.see(idx)
+                    for x in self.listbox.get_children():
+                        self.listbox.selection_remove(x)
+                    self.listbox.selection_set(str(idx))
+                    self.listbox.see(str(idx))
                     break
         elif pid_str:
             for idx, data in self.listbox_map.items():
@@ -1603,20 +1646,21 @@ class PackageViewerApp:
                     p = data.get("packageId")
                     pstr = str(int(p)) if isinstance(p, (int, float)) else str(p) if p else ""
                     if pstr == pid_str:
-                        self.listbox.selection_clear(0, tk.END)
-                        self.listbox.selection_set(idx)
-                        self.listbox.see(idx)
+                        for x in self.listbox.get_children():
+                            self.listbox.selection_remove(x)
+                        self.listbox.selection_set(str(idx))
+                        self.listbox.see(str(idx))
                         break
-        sel = self.listbox.curselection()
+        sel = self.listbox.selection()
         if sel:
             self._on_select(None)
 
     def _on_unmap_click(self):
         """取消手动映射"""
-        sel = self.listbox.curselection()
+        sel = self.listbox.selection()
         if not sel:
             return
-        idx = sel[0]
+        idx = int(sel[0])
         item = self.listbox_map.get(idx)
         if not item or isinstance(item, dict):
             messagebox.showinfo("取消映射", "请选中已通过手动映射关联的资源。")
@@ -1661,11 +1705,11 @@ class PackageViewerApp:
             pass
 
     def _set_filter_sash(self):
-        """收窄发行商列所占宽度（类型约 300px），使发行商列整列含滚动条能露出"""
+        """设置类型列宽度为 200px，平衡类型显示和发行商滚动条可见"""
         try:
             pw = getattr(self, "_filter_two_col", None)
             if pw and pw.winfo_exists():
-                pw.sashpos(0, 300)
+                pw.sashpos(0, 200)
         except Exception:
             pass
 
@@ -1707,8 +1751,13 @@ class PackageViewerApp:
         for w in getattr(self, "_theme_frames_bg", []):
             if w.winfo_exists():
                 w.config(bg=self._web_bg)
-        if getattr(self, "listbox", None) and self.listbox.winfo_exists():
-            self.listbox.config(bg=self._web_card_bg, fg=self._web_fg, selectbackground=self._web_select_bg, selectforeground=self._web_fg)
+        # Treeview 不支持 bg/fg/selectbackground，需用 ttk.Style
+        try:
+            s = ttk.Style()
+            s.configure("Treeview", background=self._web_card_bg, foreground=self._web_fg, fieldbackground=self._web_card_bg)
+            s.map("Treeview", background=[("selected", self._web_select_bg)], foreground=[("selected", self._web_fg)])
+        except Exception:
+            pass
         for btn in (getattr(self, "sort_btn", None), getattr(self, "filter_btn", None), getattr(self, "_refresh_btn", None)):
             if btn and btn.winfo_exists():
                 btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
@@ -1728,14 +1777,23 @@ class PackageViewerApp:
             self._back_to_doc_btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
         if getattr(self, "_filter_clear_btn", None) and self._filter_clear_btn.winfo_exists():
             self._filter_clear_btn.config(bg=t["btn_bg"], fg=self._web_fg, activebackground=t["btn_active"], activeforeground=self._web_fg)
-        for name in ("_filter_search_row", "_filter_type_frame", "_filter_type_canvas", "_filter_pub_frame", "_filter_pub_canvas", "_filter_pub_inner"):
+        for name in ("_filter_search_row", "_filter_type_frame", "_filter_type_canvas", "_filter_pub_frame", "_filter_pub_canvas", "_filter_pub_inner", "_filter_cn_frame"):
             w = getattr(self, name, None)
             if w and w.winfo_exists():
                 w.config(bg=self._web_bg)
+        if getattr(self, "_filter_cn_only_cb", None) and self._filter_cn_only_cb.winfo_exists():
+            self._filter_cn_only_cb.config(bg=self._web_bg, fg=self._web_fg, selectcolor=self._web_card_bg, activebackground=self._web_bg, activeforeground=self._web_fg)
+        # 更新 cn_frame 中的子标签
+        if getattr(self, "_filter_cn_frame", None) and self._filter_cn_frame.winfo_exists():
+            for child in self._filter_cn_frame.winfo_children():
+                if isinstance(child, ttk.Label) and child.winfo_exists():
+                    child.config(foreground=self._web_fg_muted)
         if getattr(self, "_filter_type_inner", None) and self._filter_type_inner.winfo_exists():
             self._update_type_tree_theme(self._filter_type_inner)
         if getattr(self, "_filter_pub_lf", None) and self._filter_pub_lf.winfo_exists():
             self._filter_pub_lf.config(bg=self._web_card_bg)
+        if getattr(self, "_filter_pub_frame_inner", None) and self._filter_pub_frame_inner.winfo_exists():
+            self._filter_pub_frame_inner.config(bg=self._web_card_bg)
         _ent_cfg = dict(bg=t["entry_bg"], fg=self._web_fg, insertbackground=self._web_fg, selectbackground=self._web_select_bg, selectforeground=self._web_fg, highlightcolor=self._web_border, highlightbackground=self._web_border)
         for name in ("_filter_entry", "_pub_entry"):
             w = getattr(self, name, None)
@@ -1805,17 +1863,18 @@ class PackageViewerApp:
             plain_html = f'<html><head><meta charset="utf-8"><style>{simple_style}</style></head><body>{wrap}<pre style="margin:0;white-space:pre-wrap;">{html.escape(str(ddata))}</pre>{wrap_end}</body></html>'
             self.detail_widget.load_html(plain_html)
         elif dtype == "summary" and ddata:
+            msg = str(ddata) if not isinstance(ddata, (tuple, list)) else str(ddata[0])
             if dark:
                 summary_style = """
     html, body { font-family: Segoe UI, sans-serif; background: #1a1a1a; color: #ffffff; margin: 0; padding: 0; font-size: 14px; }
     .wrap { background: #1a1a1a; color: #ffffff; padding: 12px; min-height: 100%; }
     """
-                html_msg = f'<html><head><meta charset="utf-8"><style>{summary_style}</style></head><body><div class="wrap"><p style="margin:0;font-weight:bold;">{html.escape(str(ddata))}</p></div></body></html>'
+                html_msg = f'<html><head><meta charset="utf-8"><style>{summary_style}</style></head><body><div class="wrap"><p style="margin:0;font-weight:bold;">{html.escape(msg)}</p></div></body></html>'
             else:
                 summary_style = """
     html, body { font-family: Segoe UI, sans-serif; background: #fff; color: #212121; margin: 0; padding: 12px; font-size: 14px; }
     """
-                html_msg = f'<html><head><meta charset="utf-8"><style>{summary_style}</style></head><body><p style="margin:0;font-weight:bold;">{html.escape(str(ddata))}</p></body></html>'
+                html_msg = f'<html><head><meta charset="utf-8"><style>{summary_style}</style></head><body><p style="margin:0;font-weight:bold;">{html.escape(msg)}</p></body></html>'
             self.detail_widget.load_html(html_msg)
 
     def _build_filter_panel(self):
@@ -1859,6 +1918,34 @@ class PackageViewerApp:
         )
         self._filter_clear_btn.pack(side=tk.RIGHT)
 
+        # 仅显示大中华区出版商的资源（单独一行，优先级最高）
+        cn_frame = tk.Frame(self.filter_container, bg=bg)
+        cn_frame.pack(fill=tk.X, pady=(0, 10))
+        self._filter_cn_only_var = tk.BooleanVar(value=False)
+        self._filter_cn_only_cb = tk.Checkbutton(
+            cn_frame,
+            text="仅显示大中华区出版商的资源",
+            variable=self._filter_cn_only_var,
+            command=self._apply_filter_to_list,
+            bg=bg,
+            fg=fg,
+            selectcolor=card,
+            activebackground=bg,
+            activeforeground=fg,
+            font=("Segoe UI", 10),
+        )
+        self._filter_cn_only_cb.pack(anchor=tk.W)
+        # 数据来源提示（仅当文件不存在时显示）
+        if not ASSETS_REMOVED_PATH.exists():
+            ttk.Label(
+                cn_frame,
+                text="数据保存在 assets_removed_march31.json",
+                style="Web.TLabel",
+                font=("Segoe UI", 9),
+                foreground=self._web_fg_muted,
+            ).pack(anchor=tk.W, padx=(20, 0))
+        self._filter_cn_frame = cn_frame
+
         # 类型 与 发行商 并排，各自独立上下滑动（无 sash 分割线）
         try:
             _ps = ttk.Style()
@@ -1868,11 +1955,11 @@ class PackageViewerApp:
         two_col = ttk.PanedWindow(self.filter_container, orient=tk.HORIZONTAL)
         two_col.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         self._filter_two_col = two_col  # 用于打开筛选时固定类型列宽度
-        # 窗口拉大时保持类型列 300px，多出的宽度都给发行商列，避免滚动条被挡住
+        # 窗口拉大时保持类型列 200px，平衡类型列和发行商列滚动条可见
         def _keep_filter_sash(e):
             try:
                 if e.widget.winfo_width() > 320:
-                    e.widget.sashpos(0, 300)
+                    e.widget.sashpos(0, 200)
             except Exception:
                 pass
         two_col.bind("<Configure>", _keep_filter_sash)
@@ -1891,21 +1978,14 @@ class PackageViewerApp:
         type_win_id = type_canvas.create_window((0, 0), window=type_inner, anchor=tk.NW)
         def _type_on_configure(e):
             b = type_canvas.bbox("all")
-            type_canvas.configure(scrollregion=type_canvas.bbox("all"))
+            type_canvas.configure(scrollregion=b)
             w = type_canvas.winfo_width()
-            ch = type_canvas.winfo_height()
-            content_h = (b[3] - b[1]) if b else 0
             if w > 1:
                 type_canvas.itemconfig(type_win_id, width=w)
-            type_canvas.itemconfig(type_win_id, height=max(content_h, ch) if ch > 0 else content_h)
         type_inner.bind("<Configure>", _type_on_configure)
         def _type_canvas_configure(e):
             if e.width > 1:
                 type_canvas.itemconfig(type_win_id, width=e.width)
-            if e.height > 1:
-                b = type_canvas.bbox("all")
-                content_h = (b[3] - b[1]) if b else e.height
-                type_canvas.itemconfig(type_win_id, height=max(content_h, e.height))
         type_canvas.bind("<Configure>", _type_canvas_configure)
         type_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         type_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1925,9 +2005,9 @@ class PackageViewerApp:
         else:
             ttk.Label(type_inner, text="(暂无类型数据，请先获取包商店信息)", style="Web.Card.TLabel", foreground=self._web_fg_muted).pack(anchor=tk.W)
 
-        # 右列：发行商（独立滚动，weight 更大让发行商区域露出更多）
+        # 右列：发行商（独立滚动，weight=3 给发行商更多空间）
         pub_frame = tk.Frame(two_col, bg=bg)
-        two_col.add(pub_frame, weight=4)
+        two_col.add(pub_frame, weight=3)
         self._filter_pub_frame = pub_frame
         pub_canvas = tk.Canvas(pub_frame, highlightthickness=0, bg=bg)
         pub_scroll = ttk.Scrollbar(pub_frame, command=pub_canvas.yview)
@@ -1938,21 +2018,14 @@ class PackageViewerApp:
         pub_win_id = pub_canvas.create_window((0, 0), window=pub_inner, anchor=tk.NW)
         def _pub_on_configure(e):
             b = pub_canvas.bbox("all")
-            pub_canvas.configure(scrollregion=pub_canvas.bbox("all"))
+            pub_canvas.configure(scrollregion=b)
             w = pub_canvas.winfo_width()
-            ch = pub_canvas.winfo_height()
-            content_h = (b[3] - b[1]) if b else 0
             if w > 1:
                 pub_canvas.itemconfig(pub_win_id, width=w)
-            pub_canvas.itemconfig(pub_win_id, height=max(content_h, ch) if ch > 0 else content_h)
         pub_inner.bind("<Configure>", _pub_on_configure)
         def _pub_canvas_configure(e):
             if e.width > 1:
                 pub_canvas.itemconfig(pub_win_id, width=e.width)
-            if e.height > 1:
-                b = pub_canvas.bbox("all")
-                content_h = (b[3] - b[1]) if b else e.height
-                pub_canvas.itemconfig(pub_win_id, height=max(content_h, e.height))
         pub_canvas.bind("<Configure>", _pub_canvas_configure)
         pub_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         pub_scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1964,7 +2037,7 @@ class PackageViewerApp:
 
         pub_lf = tk.Frame(pub_inner, bg=card, padx=10, pady=10)
         self._filter_pub_lf = pub_lf
-        pub_lf.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        pub_lf.pack(fill=tk.X, expand=False, pady=(0, 8), anchor=tk.N)
         ttk.Label(pub_lf, text="发行商", style="Web.Card.TLabel", font=("Segoe UI", 10, "bold")).pack(anchor=tk.W, pady=(0, 6))
         self._filter_pub_search = tk.StringVar()
         ttk.Label(pub_lf, text="搜索发行商", style="Web.Card.TLabel").pack(anchor=tk.W)
@@ -1977,18 +2050,15 @@ class PackageViewerApp:
         )
         self._pub_entry.pack(fill=tk.X, pady=(4, 8), ipady=4, ipadx=6)
         self._filter_pub_vars = {}
+        self._filter_pub_checkbuttons = {}  # 存储复选框引用
+        self._filter_pub_frame_inner = tk.Frame(pub_lf, bg=card)  # 用于存放发行商复选框的容器
+        self._filter_pub_frame_inner.pack(fill=tk.X, expand=False, anchor=tk.N)
         pub_counts = self._collect_publisher_counts()
-        for pub_name, count in sorted(pub_counts.items(), key=lambda x: -x[1])[:20]:
-            self._filter_pub_vars[pub_name] = tk.BooleanVar(value=False)
-            ttk.Checkbutton(
-                pub_lf,
-                text=f"{pub_name} ({count})",
-                variable=self._filter_pub_vars[pub_name],
-                command=self._apply_filter_to_list,
-                style="Web.Card.TCheckbutton",
-            ).pack(anchor=tk.W)
+        self._build_publisher_list(pub_counts)
+        # 搜索框输入时实时过滤发行商列表
+        self._filter_pub_search.trace_add("write", lambda *_: self._filter_publisher_list())
         if not pub_counts:
-            ttk.Label(pub_lf, text="(暂无发行商数据，请先获取包商店信息)", style="Web.Card.TLabel", foreground=self._web_fg_muted).pack(anchor=tk.W)
+            ttk.Label(self._filter_pub_frame_inner, text="(暂无发行商数据，请先获取包商店信息)", style="Web.Card.TLabel", foreground=self._web_fg_muted).pack(anchor=tk.W)
 
     def _collect_category_counts(self):
         """从 metadata 目录下的 json 汇总分类（类型）及数量"""
@@ -2140,6 +2210,8 @@ class PackageViewerApp:
                     frame.pack(anchor=tk.W, fill=tk.X, after=after_w)
                     arrow.config(text="∧")
                     var.set(True)
+                # 展开/折叠后更新 Canvas 滚动区域
+                type_canvas.after(10, lambda: type_canvas.configure(scrollregion=type_canvas.bbox("all")))
 
             arrow_lbl.bind("<Button-1>", lambda e, t=_toggle: t())
 
@@ -2184,7 +2256,77 @@ class PackageViewerApp:
         for v in getattr(self, "_filter_pub_vars", {}).values():
             v.set(False)
         self._filter_pub_search.set("")
+        if getattr(self, "_filter_cn_only_var", None):
+            self._filter_cn_only_var.set(False)
+        # 清空搜索后重新显示所有发行商
+        self._filter_publisher_list()
         self._apply_filter_to_list()
+
+    def _build_publisher_list(self, pub_counts: dict):
+        """构建发行商复选框列表，默认显示前20个，搜索时显示匹配的所有"""
+        # 清除旧的内容
+        frame = getattr(self, "_filter_pub_frame_inner", None)
+        if not frame:
+            return
+        for widget in frame.winfo_children():
+            widget.destroy()
+        self._filter_pub_checkbuttons.clear()
+
+        if not pub_counts:
+            ttk.Label(frame, text="(暂无发行商数据，请先获取包商店信息)", style="Web.Card.TLabel", foreground=self._web_fg_muted).pack(anchor=tk.W)
+            return
+
+        # 按数量降序排序，存储完整列表
+        self._all_publishers = sorted(pub_counts.items(), key=lambda x: -x[1])
+
+        # 默认显示前20个
+        for pub_name, count in self._all_publishers[:20]:
+            if pub_name not in self._filter_pub_vars:
+                self._filter_pub_vars[pub_name] = tk.BooleanVar(value=False)
+            cb = ttk.Checkbutton(
+                frame,
+                text=f"{pub_name} ({count})",
+                variable=self._filter_pub_vars[pub_name],
+                command=self._apply_filter_to_list,
+                style="Web.Card.TCheckbutton",
+            )
+            cb.pack(anchor=tk.W)
+            self._filter_pub_checkbuttons[pub_name] = cb
+
+    def _filter_publisher_list(self):
+        """根据搜索框内容过滤发行商列表，搜索时显示所有匹配项（不限20个）"""
+        search_text = (self._filter_pub_search.get() or "").strip().lower()
+        frame = getattr(self, "_filter_pub_frame_inner", None)
+        if not frame:
+            return
+
+        all_publishers = getattr(self, "_all_publishers", [])
+
+        # 清空当前显示
+        for widget in frame.winfo_children():
+            widget.destroy()
+        self._filter_pub_checkbuttons.clear()
+
+        if not search_text:
+            # 搜索为空，显示前20个
+            display_list = all_publishers[:20]
+        else:
+            # 搜索不为空，显示所有匹配的（不限数量）
+            display_list = [(name, count) for name, count in all_publishers if search_text in name.lower()]
+
+        # 重新构建复选框
+        for pub_name, count in display_list:
+            if pub_name not in self._filter_pub_vars:
+                self._filter_pub_vars[pub_name] = tk.BooleanVar(value=False)
+            cb = ttk.Checkbutton(
+                frame,
+                text=f"{pub_name} ({count})",
+                variable=self._filter_pub_vars[pub_name],
+                command=self._apply_filter_to_list,
+                style="Web.Card.TCheckbutton",
+            )
+            cb.pack(anchor=tk.W)
+            self._filter_pub_checkbuttons[pub_name] = cb
 
     def _apply_filter_to_list(self):
         """根据筛选条件过滤左侧列表。已实现：搜索我的资源、类型、发行商。"""
@@ -2232,9 +2374,10 @@ class PackageViewerApp:
         self._update_open_in_unity_visibility()
 
     def _toggle_sort(self):
-        self.sort_by_snapshot = not self.sort_by_snapshot
-        self.sort_btn.config(text="按购买顺序" if self.sort_by_snapshot else "按字母排序")
-        self._filter_list()
+        self.sort_mode = (self.sort_mode + 1) % 2
+        labels = ("按购买顺序", "按字母排序")
+        self.sort_btn.config(text=labels[self.sort_mode])
+        self.root.after_idle(self._filter_list)  # 延后执行，避免切换时卡顿
 
     def _refresh(self):
         self.package_files = []
@@ -2299,6 +2442,9 @@ class PackageViewerApp:
             if filename in existing_names:
                 purchased_downloaded += 1
                 count_sanitize += 1
+                self.filename_to_pid[filename] = int(pid) if isinstance(pid, (int, float)) else pid
+                self.filename_to_display_name[filename] = display_name
+                self.purchase_order[filename] = grant_time
                 continue
             # 3) 再次：检查手动映射
             manual_fn = manual.get(pid_str)
@@ -2350,26 +2496,79 @@ class PackageViewerApp:
         # 仅用「搜索我的资源」作为列表关键词（筛选面板内的输入框）
         sv = getattr(self, "_filter_search_var", None)
         keyword = (sv.get() if sv else "").strip().lower()
-        self.listbox.delete(0, tk.END)
+        for kid in self.listbox.get_children():
+            self.listbox.delete(kid)
         self.listbox_map.clear()
-        items = []
+
+        # ========== 第一步：准备原始数据 ==========
+        all_items = []
         if not self.package_files and not self.missing_items:
             return
-        if keyword:
-            for p in self.package_files:
-                display_name = (getattr(self, "filename_to_display_name", {}) or {}).get(p.name) or p.name
-                if keyword in p.name.lower() or keyword in display_name.lower():
-                    items.append(("existing", p))
-            for m in self.missing_items:
-                if keyword in m["filename"].lower() or keyword in (m.get("displayName") or "").lower():
-                    items.append(("missing", m))
-        else:
-            for p in self.package_files:
-                items.append(("existing", p))
-            for m in self.missing_items:
-                items.append(("missing", m))
+        for p in self.package_files:
+            all_items.append(("existing", p))
+        for m in self.missing_items:
+            all_items.append(("missing", m))
 
-        # 类型（分类）筛选：若勾选了类型，只保留 metadata 中分类在勾选范围内的项
+        # ========== 第二步：大中华区筛选（优先级最高） ==========
+        removed = load_assets_removed()
+        manual = load_manual_mapping() or {}
+
+        def _get_pid_once(typ, data):
+            if typ == "missing":
+                return data.get("packageId")
+            pid = (getattr(self, "filename_to_pid", None) or {}).get(data.name)
+            if pid is not None:
+                return pid
+            for pid_str, fn in manual.items():
+                if fn and data.name == fn:
+                    try:
+                        return int(pid_str) if str(pid_str).isdigit() else pid_str
+                    except (ValueError, TypeError):
+                        return pid_str
+            for it in (self.purchases or []):
+                dn = str(it.get("displayName") or "")
+                if not dn:
+                    continue
+                cands = [dn + ".unitypackage", sanitize_filename(dn) + ".unitypackage"]
+                dn_n = _normalize_fullwidth(dn)
+                if dn_n != dn:
+                    cands.extend([dn_n + ".unitypackage", sanitize_filename(dn_n) + ".unitypackage"])
+                if data.name in cands:
+                    return it.get("packageId")
+            return None
+
+        def _to_pid_str(pid):
+            if pid is None:
+                return ""
+            return str(int(pid)) if isinstance(pid, (int, float)) else str(pid)
+
+        # 预计算 is_removed
+        items_with_removed = []
+        for (typ, data) in all_items:
+            pid = _get_pid_once(typ, data)
+            pid_str = _to_pid_str(pid)
+            items_with_removed.append((typ, data, pid_str in removed))
+
+        # 仅显示大中华区出版商的资源筛选（优先级最高）
+        cn_only = getattr(self, "_filter_cn_only_var", None)
+        if cn_only and cn_only.get():
+            items_with_removed = [(typ, data, is_removed) for (typ, data, is_removed) in items_with_removed if is_removed]
+
+        # ========== 第三步：应用其他筛选条件 ==========
+        # 关键词筛选
+        if keyword:
+            filtered_items = []
+            for (typ, data, is_removed) in items_with_removed:
+                if typ == "existing":
+                    display_name = (getattr(self, "filename_to_display_name", {}) or {}).get(data.name) or data.name
+                    if keyword in data.name.lower() or keyword in display_name.lower():
+                        filtered_items.append((typ, data, is_removed))
+                else:
+                    if keyword in data["filename"].lower() or keyword in (data.get("displayName") or "").lower():
+                        filtered_items.append((typ, data, is_removed))
+            items_with_removed = filtered_items
+
+        # 类型（分类）筛选
         selected_types = []
         if getattr(self, "_filter_type_vars", None):
             selected_types = [k for k, v in self._filter_type_vars.items() if v.get()]
@@ -2397,9 +2596,9 @@ class PackageViewerApp:
                     if cat_name == st or cat_name.startswith(st + "/"):
                         return True
                 return False
-            items = [(t, d) for t, d in items if _match_category(_category_for_item(t, d))]
+            items_with_removed = [(t, d, r) for (t, d, r) in items_with_removed if _match_category(_category_for_item(t, d))]
 
-        # 发行商筛选：若勾选了发行商，只保留 metadata 中发行商在勾选范围内的项
+        # 发行商筛选
         selected_pubs = []
         if getattr(self, "_filter_pub_vars", None):
             selected_pubs = [k for k, v in self._filter_pub_vars.items() if v.get()]
@@ -2420,37 +2619,44 @@ class PackageViewerApp:
                     return pub.get("name") if isinstance(pub, dict) else None
                 except Exception:
                     return None
-            items = [(t, d) for t, d in items if _publisher_for_item(t, d) in selected_pubs]
+            items_with_removed = [(t, d, r) for (t, d, r) in items_with_removed if _publisher_for_item(t, d) in selected_pubs]
 
-        def sort_key(x):
+        # ========== 第四步：统计大中华区数量（在所有筛选之后） ==========
+        greater_china_count = sum(1 for x in items_with_removed if x[2])
+        cn_cb = getattr(self, "_filter_cn_only_cb", None)
+        if cn_cb and cn_cb.winfo_exists():
+            cn_cb.config(text=f"仅显示大中华区出版商的资源 ({greater_china_count})")
+
+        def secondary_key(x):
             name = x[1].name if x[0] == "existing" else x[1]["filename"]
-            if self.sort_by_snapshot:
-                # 在购买列表中的用真实 grantTime；不在的用 0000 排到最后（避免文件名不匹配时 9999 排第一）
+            if self.sort_mode == 0:
                 grant_time = self.purchase_order.get(name, "0000-00-00")
-                # 降序：最新领取的在前（grantTime 大的在前）
                 return (grant_time, name.lower())
             return (0, name.lower())
 
-        items.sort(key=sort_key, reverse=self.sort_by_snapshot)
+        items_with_removed.sort(key=lambda x: secondary_key((x[0], x[1])), reverse=(self.sort_mode == 0))
 
-        for i, (typ, data) in enumerate(items):
+        # 更新排序按钮文字
+        labels = ("按购买顺序", "按字母排序")
+        if getattr(self, "sort_btn", None) and self.sort_btn.winfo_exists():
+            self.sort_btn.config(text=labels[self.sort_mode])
+
+        for i, (typ, data, is_removed) in enumerate(items_with_removed):
             if typ == "existing":
-                # 有 displayName 时显示资源名（无后缀），否则显示文件名（带 .unitypackage）
                 display_name = (getattr(self, "filename_to_display_name", {}) or {}).get(data.name) or data.name
-                self.listbox_map[i] = data
-                self.listbox.insert(tk.END, display_name)
+                text = display_name
             else:
-                self.listbox_map[i] = data
-                self.listbox.insert(tk.END, data["displayName"])
-            if typ == "missing":
-                self.listbox.itemconfig(i, fg="red")
+                text = data["displayName"]
+            self.listbox_map[i] = data
+            tags = ("missing",) if typ == "missing" else ()
+            self.listbox.insert("", tk.END, iid=str(i), text=text, tags=tags)
 
     def _on_select(self, event):
-        sel = self.listbox.curselection()
-        if not sel:
+        sel = self.listbox.selection()
+        idx = int(sel[0]) if sel else None
+        if idx is None:
             self._update_open_in_unity_visibility()
             return
-        idx = sel[0]
         item = self.listbox_map.get(idx)
         if not item:
             self._update_open_in_unity_visibility()
@@ -2475,12 +2681,24 @@ class PackageViewerApp:
         info_path = METADATA_DIR / f"{package_id}.json"
         is_missing = isinstance(item, dict)
 
+        # 检查是否在 2026-03-31 下架清单中
+        pid_str = str(int(package_id)) if isinstance(package_id, (int, float)) else str(package_id)
+        removed_info = load_assets_removed().get(pid_str)
+        # 3月31日之前显示下架提示，之后不再显示
+        if removed_info and date.today() < date(2026, 3, 31):
+            removed_notice = "※ 该资产将于 2026-03-31 从 Asset Store 下架。"
+        else:
+            removed_notice = ""
+
         if is_missing:
             if info_path.exists():
                 try:
                     data = json.loads(info_path.read_text(encoding="utf-8"))
+                    extra = "※ 未下载：下载目录中无此文件。"
+                    if removed_notice:
+                        extra = extra + " " + removed_notice
                     if self._use_html:
-                        self._show_html_with_async_emoji(data, extra_notice="※ 未下载：下载目录中无此文件。", dark=self._dark_theme)
+                        self._show_html_with_async_emoji(data, extra_notice=extra, dark=self._dark_theme)
                     else:
                         self._set_detail_content(plain_text=f"※ 未下载：下载目录中无此文件。\n\n{format_info(data)}")
                 except Exception:
