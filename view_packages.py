@@ -899,6 +899,12 @@ class PackageViewerApp:
             text="手动映射数据保存在 manual_mapping.json，注意备份",
             style="Web.TLabel",
         ).pack(side=tk.LEFT, anchor=tk.W)
+        self._file_count_label = ttk.Label(
+            tab1_manual_hint,
+            text="",
+            style="Web.TLabel",
+        )
+        self._file_count_label.pack(side=tk.LEFT, anchor=tk.W, padx=(8, 0))
         if not self.download_dir.exists():
             ttk.Label(tab1, text="(目录不存在)", style="Web.TLabel", foreground="red").pack(anchor=tk.W)
 
@@ -2253,16 +2259,21 @@ class PackageViewerApp:
             self._filter_list()
             msg = f"目录不存在: {self.download_dir}"
             self._set_detail_content(plain_text=msg)
+            if getattr(self, "_file_count_label", None) and self._file_count_label.winfo_exists():
+                self._file_count_label.config(text="（目录下共有文件 0 个，0|0|0）")
             self._update_open_in_unity_visibility()
             return
 
-        existing_files = list(self.download_dir.glob("*.unitypackage"))
+        existing_files = list(self.download_dir.glob("*.unitypackage"))  # 仅 .unitypackage，不含 .part 等
         existing_names = {p.name for p in existing_files}
         self.package_files = list(existing_files)
         manual = load_manual_mapping()
 
         self.purchase_order = {}
         purchased_downloaded = 0  # 购买列表中、对应文件已存在的数量
+        count_raw = 0  # 完全相等
+        count_sanitize = 0  # sanitize 匹配
+        count_manual = 0  # 手动映射
         for item in self.purchases:
             display_name = str(item.get("displayName") or "")
             pid = item.get("packageId")
@@ -2274,24 +2285,40 @@ class PackageViewerApp:
             if not display_name or not pid:
                 continue
             pid_str = str(int(pid)) if isinstance(pid, (int, float)) else str(pid)
+            # 1) 优先：完全相等（displayName 直接 + .unitypackage，无 sanitize），可能存在此类文件
+            filename_raw = display_name + ".unitypackage"
+            if filename_raw in existing_names:
+                purchased_downloaded += 1
+                count_raw += 1
+                self.filename_to_pid[filename_raw] = int(pid) if isinstance(pid, (int, float)) else pid
+                self.filename_to_display_name[filename_raw] = display_name
+                self.purchase_order[filename_raw] = grant_time
+                continue
+            # 2) 其次：按 unity_assets_downloader 起名规则（sanitize）匹配
+            filename = sanitize_filename(display_name) + ".unitypackage"
+            if filename in existing_names:
+                purchased_downloaded += 1
+                count_sanitize += 1
+                continue
+            # 3) 再次：检查手动映射
             manual_fn = manual.get(pid_str)
             if manual_fn and manual_fn in existing_names:
                 purchased_downloaded += 1
+                count_manual += 1
                 self.filename_to_pid[manual_fn] = int(pid) if isinstance(pid, (int, float)) else pid
                 self.filename_to_display_name[manual_fn] = display_name
                 self.purchase_order[manual_fn] = grant_time
                 continue
-            filename = sanitize_filename(display_name) + ".unitypackage"
-            if filename in existing_names:
-                purchased_downloaded += 1
-            else:
-                self.missing_items.append({
-                    "filename": filename,
-                    "displayName": display_name,
-                    "packageId": pid,
-                    "grantTime": grant_time,
-                })
+            # 4) 以上均不匹配，视为未下载，需手动映射
+            self.missing_items.append({
+                "filename": filename,
+                "displayName": display_name,
+                "packageId": pid,
+                "grantTime": grant_time,
+            })
 
+        if getattr(self, "_file_count_label", None) and self._file_count_label.winfo_exists():
+            self._file_count_label.config(text=f"（目录下共有文件 {len(existing_files)} 个，{count_raw}|{count_sanitize}|{count_manual}）")
         self._filter_list()
         msg = f"共 {purchased_downloaded} 个已下载，{len(self.missing_items)} 个未下载（红色），合计 {purchased_downloaded + len(self.missing_items)} 个资源"
         self._current_summary_msg = msg
